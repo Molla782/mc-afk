@@ -16,6 +16,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
 const { Buffer } = require('buffer');
+const dns = require('dns');
 
 const sessionPassword = crypto.randomBytes(8).toString('hex'); // 16-char hex
 console.log('🔐 Session password:', sessionPassword);
@@ -1076,88 +1077,6 @@ app.post('/api/minecraft/connect-bedrock', (req, res) => {
     });
 });
 
-// Function to connect Bedrock client
-async function connectBedrockClient(connectionId) {
-    const connection = connections[connectionId];
-    if (!connection) {
-        console.error(`[ERROR] Connection ${connectionId} not found`);
-        return;
-    }
-    
-    try {
-        console.log(`[INFO] Connecting to Bedrock server ${connection.serverAddress}:${connection.serverPort} as ${connection.username}`);
-        
-        // Create a UDP socket
-        const client = dgram.createSocket('udp4');
-        
-        // Store client reference
-        connection.client = client;
-        connection.status = 'connecting';
-        connection.lastActivity = Date.now();
-        
-        // Set up connection state
-        const connectionState = {
-            serverAddress: connection.serverAddress,
-            serverPort: parseInt(connection.serverPort),
-            username: connection.username,
-            clientGuid: crypto.randomBytes(8).readBigUInt64BE(0),
-            mtuSize: 1400, // Default MTU size
-            reliableFrameIndex: 0,
-            splitPacketCounter: 0,
-            fragmentedPackets: new Map(),
-            sequenceNumber: 0,
-            lastReceivedSequence: -1,
-            encryptionEnabled: false,
-            authenticated: false
-        };
-        
-        // Store connection state
-        connection.state = connectionState;
-        
-        // Set up event handlers for the UDP socket
-        client.on('message', (msg, rinfo) => {
-            handleBedrockPacket(connectionId, msg, rinfo);
-        });
-        
-        client.on('error', (err) => {
-            console.error(`[ERROR] Bedrock client socket error: ${err.message}`);
-            connection.status = 'error';
-            connection.error = err.message;
-            addChatMessage(connectionId, 'system', `Error: ${err.message}`);
-        });
-        
-        client.on('close', () => {
-            console.log(`[INFO] Bedrock client socket closed`);
-            connection.status = 'disconnected';
-            addChatMessage(connectionId, 'system', 'Connection closed');
-        });
-        
-        // Bind the socket to a random port
-        client.bind(0, () => {
-            console.log(`[INFO] UDP socket bound to port ${client.address().port}`);
-            
-            // Start the connection process by sending an unconnected ping
-            sendUnconnectedPing(connectionId);
-        });
-        
-        // Store the connection in activeConnections for later use
-        activeConnections.set(connectionId, {
-            client: client,
-            edition: 'bedrock',
-            username: connection.username,
-            serverAddress: connection.serverAddress,
-            serverPort: connection.serverPort,
-            messages: []
-        });
-        
-        return true;
-    } catch (error) {
-        console.error(`[ERROR] Failed to connect Bedrock client: ${error.message}`, error.stack);
-        connection.status = 'error';
-        connection.error = `Failed to initialize connection: ${error.message}`;
-        return false;
-    }
-}
 
 app.post('/api/minecraft/send-message/:connectionId', async (req, res) => {
     const connectionId = req.params.connectionId;
@@ -2276,8 +2195,8 @@ function sendOpenConnectionRequest1(connectionId) {
         magic.copy(buffer, offset);
         offset += 16;
         
-        // Protocol version (10 for current Bedrock)
-        buffer.writeUInt8(10, offset++);
+        // Protocol version (11 for Bedrock 1.21.x)
+        buffer.writeUInt8(11, offset++); // Updated from 10 to 11
         
         // MTU size padding (to determine max packet size)
         // Fill the rest of the packet with padding
@@ -2363,8 +2282,8 @@ function sendOpenConnectionRequest2(connectionId) {
             buffer.writeUInt16BE(connection.state.serverPort, offset);
             offset += 2;
         } else {
-            // Handle domain name - resolve to IP first
-            console.error(`[ERROR] Domain name not resolved to IP: ${connection.state.serverAddress}`);
+            // This should not happen now that we resolve domains
+            console.error(`[ERROR] Invalid IP address format: ${connection.state.serverAddress}`);
             return;
         }
         
@@ -2688,7 +2607,7 @@ async function createLoginPayload(username, clientGuid) {
         buffer.writeUInt8(0x01, offset++);
         
         // Protocol version
-        buffer.writeInt32BE(582, offset); // Updated protocol version for Bedrock 1.20
+        buffer.writeInt32BE(622, offset); // Updated protocol version for Bedrock 1.20
         offset += 4;
         
         // Payload length placeholder
@@ -3526,6 +3445,22 @@ async function connectBedrockClient(connectionId) {
     try {
         console.log(`[INFO] Connecting to Bedrock server ${connection.serverAddress}:${connection.serverPort} as ${connection.username}`);
         
+        // Resolve domain name to IP address
+        try {
+            const resolvedAddress = await resolveDomain(connection.serverAddress);
+            if (resolvedAddress !== connection.serverAddress) {
+                console.log(`[INFO] Using resolved IP address: ${resolvedAddress} for ${connection.serverAddress}`);
+                // Store both the original domain and the resolved IP
+                connection.originalServerAddress = connection.serverAddress;
+                connection.serverAddress = resolvedAddress;
+            }
+        } catch (error) {
+            console.error(`[ERROR] Failed to resolve domain: ${error.message}`);
+            connection.status = 'error';
+            connection.error = `Failed to resolve domain: ${error.message}`;
+            return false;
+        }
+        
         // Check if Microsoft authentication is needed
         if (connection.useMicrosoftAuth) {
             console.log(`[INFO] Using Microsoft authentication for Bedrock`);
@@ -3606,7 +3541,7 @@ async function connectBedrockClient(connectionId) {
             client: client,
             edition: 'bedrock',
             username: connection.username,
-            serverAddress: connection.serverAddress,
+            serverAddress: connection.originalServerAddress || connection.serverAddress,
             serverPort: connection.serverPort,
             messages: [],
             startTime: Date.now()
@@ -3619,4 +3554,88 @@ async function connectBedrockClient(connectionId) {
         connection.error = `Failed to initialize connection: ${error.message}`;
         return false;
     }
+}
+function debugConnection(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    console.log(`[DEBUG] Connection state for ${connectionId}:`);
+    console.log(`  Server: ${connection.state.serverAddress}:${connection.state.serverPort}`);
+    console.log(`  Status: ${connection.status}`);
+    console.log(`  Username: ${connection.username}`);
+    console.log(`  Client GUID: ${connection.state.clientGuid}`);
+    
+    // Set up a timeout to retry the connection if needed
+    setTimeout(() => {
+        if (connection.status !== 'connected') {
+            console.log(`[DEBUG] Connection still not established, retrying open connection request 1...`);
+            sendOpenConnectionRequest1(connectionId);
+        }
+    }, 5000);
+}
+function retryConnection(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    console.log(`[INFO] Retrying connection to ${connection.serverAddress}:${connection.serverPort}`);
+    
+    // Reset connection state
+    connection.status = 'connecting';
+    connection.error = null;
+    
+    // Start the connection process again
+    sendUnconnectedPing(connectionId);
+    
+    // Set up a timeout to check if the connection succeeded
+    setTimeout(() => {
+        if (connection.status !== 'connected') {
+            console.log(`[INFO] Connection still not established after retry`);
+        }
+    }, 10000);
+}
+
+// Add a button to the UI to retry the connection
+app.post('/api/minecraft/retry-connection/:connectionId', (req, res) => {
+    try {
+        const connectionId = req.params.connectionId;
+        
+        // Check if connection exists
+        if (connections && connections[connectionId]) {
+            // Retry the connection
+            retryConnection(connectionId);
+            
+            return res.json({ success: true });
+        } else {
+            return res.status(404).json({ error: 'Connection not found' });
+        }
+    } catch (error) {
+        console.error('Error retrying connection:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+function resolveDomain(domain) {
+    return new Promise((resolve, reject) => {
+        const dns = require('dns');
+        
+        // Check if the input is already an IP address
+        const ipv4Pattern = /^(\d{1,3}\.){3}\d{1,3}$/;
+        if (ipv4Pattern.test(domain)) {
+            console.log(`[INFO] Domain is already an IP address: ${domain}`);
+            return resolve(domain);
+        }
+        
+        console.log(`[INFO] Resolving domain: ${domain}`);
+        
+        // Lookup the domain
+        dns.lookup(domain, (err, address, family) => {
+            if (err) {
+                console.error(`[ERROR] Failed to resolve domain ${domain}: ${err.message}`);
+                reject(err);
+                return;
+            }
+            
+            console.log(`[INFO] Resolved ${domain} to ${address} (IPv${family})`);
+            resolve(address);
+        });
+    });
 }
