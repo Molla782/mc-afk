@@ -15,6 +15,8 @@ const bedrock = require('bedrock-protocol');
 const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
+const crypto = require('crypto');
+const { Buffer } = require('buffer');
 
 const sessionPassword = crypto.randomBytes(8).toString('hex'); // 16-char hex
 console.log('🔐 Session password:', sessionPassword);
@@ -1085,97 +1087,68 @@ async function connectBedrockClient(connectionId) {
     
     try {
         console.log(`[INFO] Connecting to Bedrock server ${connection.serverAddress}:${connection.serverPort} as ${connection.username}`);
-        const { createClient } = require('bedrock-protocol');
-        const useAuthentication = connection.authenticated === true;
         
-        let clientOptions = {
-            host: connection.serverAddress,
-            port: parseInt(connection.serverPort),
-            username: connection.username
-        };
-        
-        if (useAuthentication) {
-            console.log(`[INFO] Using authenticated mode for Bedrock connection`);
-            
-            // Instead of using our custom authentication, let bedrock-protocol handle it
-            clientOptions.offline = false;
-            clientOptions.authTitle = true;
-            clientOptions.auth = 'msa';
-            
-            // Create a cache folder for tokens if it doesn't exist
-            const profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
-            if (!fs.existsSync(profilesFolder)) {
-                fs.mkdirSync(profilesFolder, { recursive: true });
-            }
-            
-            // Add profiles folder for token caching
-            clientOptions.profilesFolder = profilesFolder;
-            
-            console.log(`[INFO] Using bedrock-protocol's built-in Microsoft authentication`);
-            
-            // Store the connection in activeConnections for later use
-            activeConnections.set(connectionId, {
-                client: null, // Will be set after client creation
-                edition: 'bedrock',
-                username: connection.username,
-                serverAddress: connection.serverAddress,
-                serverPort: connection.serverPort,
-                messages: []
-            });
-        } else {
-            console.log(`[INFO] Using offline mode for Bedrock connection`);
-            clientOptions.offline = true;
-        }
-        
-        // Create Bedrock client
-        console.log('[DEBUG] Creating Bedrock client with options:', {
-            ...clientOptions,
-            // Don't log sensitive information
-            accessToken: clientOptions.accessToken ? '[REDACTED]' : undefined
-        });
-        
-        const client = createClient(clientOptions);
+        // Create a UDP socket
+        const client = dgram.createSocket('udp4');
         
         // Store client reference
         connection.client = client;
+        connection.status = 'connecting';
+        connection.lastActivity = Date.now();
         
-        // Update the activeConnections entry with the client
-        if (activeConnections.has(connectionId)) {
-            const activeConnection = activeConnections.get(connectionId);
-            activeConnection.client = client;
-        }
+        // Set up connection state
+        const connectionState = {
+            serverAddress: connection.serverAddress,
+            serverPort: parseInt(connection.serverPort),
+            username: connection.username,
+            clientGuid: crypto.randomBytes(8).readBigUInt64BE(0),
+            mtuSize: 1400, // Default MTU size
+            reliableFrameIndex: 0,
+            splitPacketCounter: 0,
+            fragmentedPackets: new Map(),
+            sequenceNumber: 0,
+            lastReceivedSequence: -1,
+            encryptionEnabled: false,
+            authenticated: false
+        };
         
-        // Handle connection events
-        client.on('spawn', () => {
-            console.log(`[INFO] Bedrock client spawned for ${connection.username}`);
-            connection.status = 'connected';
-            connection.lastActivity = Date.now();
-            
-            // Add chat message about successful connection
-            addChatMessage(connectionId, 'system', `Connected to ${connection.serverAddress}:${connection.serverPort}`);
-        });
+        // Store connection state
+        connection.state = connectionState;
         
-        // Rest of the event handlers remain the same
-        client.on('text', (packet) => {
-            if (packet.message) {
-                console.log(`[CHAT] ${packet.message}`);
-                addChatMessage(connectionId, 'server', packet.message);
-                connection.lastActivity = Date.now();
-            }
-        });
-        
-        client.on('disconnect', (packet) => {
-            console.log(`[INFO] Disconnected from Bedrock server: ${packet?.message || 'Unknown reason'}`);
-            addChatMessage(connectionId, 'system', `Disconnected: ${packet?.message || 'Unknown reason'}`);
-            connection.status = 'disconnected';
-            connection.disconnectReason = packet?.message || 'Unknown reason';
+        // Set up event handlers for the UDP socket
+        client.on('message', (msg, rinfo) => {
+            handleBedrockPacket(connectionId, msg, rinfo);
         });
         
         client.on('error', (err) => {
-            console.error(`[ERROR] Bedrock client error: ${err.message}`);
+            console.error(`[ERROR] Bedrock client socket error: ${err.message}`);
             connection.status = 'error';
             connection.error = err.message;
             addChatMessage(connectionId, 'system', `Error: ${err.message}`);
+        });
+        
+        client.on('close', () => {
+            console.log(`[INFO] Bedrock client socket closed`);
+            connection.status = 'disconnected';
+            addChatMessage(connectionId, 'system', 'Connection closed');
+        });
+        
+        // Bind the socket to a random port
+        client.bind(0, () => {
+            console.log(`[INFO] UDP socket bound to port ${client.address().port}`);
+            
+            // Start the connection process by sending an unconnected ping
+            sendUnconnectedPing(connectionId);
+        });
+        
+        // Store the connection in activeConnections for later use
+        activeConnections.set(connectionId, {
+            client: client,
+            edition: 'bedrock',
+            username: connection.username,
+            serverAddress: connection.serverAddress,
+            serverPort: connection.serverPort,
+            messages: []
         });
         
         return true;
@@ -2126,3 +2099,1478 @@ app.get('/api/minecraft/status/:connectionId', (req, res) => {
         res.status(500).json({ error: error.message });
     }
 });
+function sendUnconnectedPing(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create an unconnected ping packet
+        const buffer = Buffer.alloc(1500);
+        let offset = 0;
+        
+        // Packet ID for unconnected ping (0x01)
+        buffer.writeUInt8(0x01, offset++);
+        
+        // Ping ID (timestamp)
+        const timestamp = BigInt(Date.now());
+        buffer.writeBigUInt64BE(timestamp, offset);
+        offset += 8;
+        
+        // Magic (16 bytes)
+        const magic = Buffer.from([0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78]);
+        magic.copy(buffer, offset);
+        offset += 16;
+        
+        // Client GUID
+        buffer.writeBigUInt64BE(connection.state.clientGuid, offset);
+        offset += 8;
+        
+        // Send the packet
+        connection.client.send(buffer.slice(0, offset), connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send unconnected ping: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent unconnected ping to ${connection.state.serverAddress}:${connection.state.serverPort}`);
+                
+                // Set a timeout for the ping response
+                connection.state.pingTimeout = setTimeout(() => {
+                    console.error(`[ERROR] Ping timeout for ${connection.state.serverAddress}:${connection.state.serverPort}`);
+                    connection.status = 'error';
+                    connection.error = 'Server did not respond to ping';
+                    addChatMessage(connectionId, 'system', `Error: Server did not respond to ping`);
+                }, 5000);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating unconnected ping packet: ${error.message}`);
+    }
+}
+
+// Function to handle incoming Bedrock packets
+function handleBedrockPacket(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    connection.lastActivity = Date.now();
+    
+    try {
+        // Read packet ID (first byte)
+        const packetId = data.readUInt8(0);
+        
+        console.log(`[DEBUG] Received packet with ID: 0x${packetId.toString(16)} from ${rinfo.address}:${rinfo.port}`);
+        
+        // Handle different packet types
+        switch (packetId) {
+            case 0x1C: // Unconnected Pong
+                handleUnconnectedPong(connectionId, data, rinfo);
+                break;
+            case 0x08: // Connection Request Accepted
+                handleConnectionRequestAccepted(connectionId, data, rinfo);
+                break;
+            // Add more packet handlers as needed
+            default:
+                console.log(`[DEBUG] Unhandled packet type: 0x${packetId.toString(16)}`);
+        }
+    } catch (error) {
+        console.error(`[ERROR] Error handling packet: ${error.message}`);
+    }
+}
+
+// Function to handle unconnected pong response
+function handleUnconnectedPong(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Clear ping timeout
+        if (connection.state && connection.state.pingTimeout) {
+            clearTimeout(connection.state.pingTimeout);
+            connection.state.pingTimeout = null;
+        }
+        
+        // Parse the pong packet
+        let offset = 1; // Skip packet ID
+        
+        // Read ping ID (timestamp)
+        const pingId = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Read server GUID
+        const serverGuid = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Skip magic (16 bytes)
+        offset += 16;
+        
+        // Read server info
+        const serverInfo = data.toString('utf8', offset);
+        console.log(`[INFO] Received server info: ${serverInfo}`);
+        
+        // Parse server info (format: MCPE;Server Name;Protocol Version;MC Version;Player Count;Max Players;Server GUID;...)
+        const parts = serverInfo.split(';');
+        if (parts.length >= 7) {
+            const serverName = parts[1];
+            const protocolVersion = parseInt(parts[2]);
+            const mcVersion = parts[3];
+            const playerCount = parseInt(parts[4]);
+            const maxPlayers = parseInt(parts[5]);
+            
+            console.log(`[INFO] Server: ${serverName}, Version: ${mcVersion}, Players: ${playerCount}/${maxPlayers}`);
+            
+            // Store server info in connection state
+            if (connection.state) {
+                connection.state.serverName = serverName;
+                connection.state.protocolVersion = protocolVersion;
+                connection.state.mcVersion = mcVersion;
+                connection.state.playerCount = playerCount;
+                connection.state.maxPlayers = maxPlayers;
+                connection.state.serverGuid = serverGuid;
+            }
+            
+            // Now send an open connection request
+            sendOpenConnectionRequest1(connectionId);
+        }
+    } catch (error) {
+        console.error(`[ERROR] Error handling unconnected pong: ${error.message}`);
+    }
+}
+function sendOpenConnectionRequest1(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create an open connection request 1 packet
+        const buffer = Buffer.alloc(1500);
+        let offset = 0;
+        
+        // Packet ID for open connection request 1 (0x05)
+        buffer.writeUInt8(0x05, offset++);
+        
+        // Magic (16 bytes)
+        const magic = Buffer.from([0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78]);
+        magic.copy(buffer, offset);
+        offset += 16;
+        
+        // Protocol version (10 for current Bedrock)
+        buffer.writeUInt8(10, offset++);
+        
+        // MTU size padding (to determine max packet size)
+        // Fill the rest of the packet with padding
+        const paddingSize = 1472 - offset; // Standard MTU size minus current offset
+        buffer.fill(0, offset, offset + paddingSize);
+        offset += paddingSize;
+        
+        // Send the packet
+        connection.client.send(buffer.slice(0, offset), connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send open connection request 1: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent open connection request 1 to ${connection.state.serverAddress}:${connection.state.serverPort}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating open connection request 1 packet: ${error.message}`);
+    }
+}
+function handleOpenConnectionReply1(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Parse the open connection reply 1 packet
+        let offset = 1; // Skip packet ID
+        
+        // Skip magic (16 bytes)
+        offset += 16;
+        
+        // Read server GUID
+        const serverGuid = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Read server security
+        const security = data.readUInt8(offset++);
+        
+        // Read MTU size
+        const mtuSize = data.readUInt16BE(offset);
+        offset += 2;
+        
+        console.log(`[INFO] Received open connection reply 1: MTU size = ${mtuSize}`);
+        
+        // Store MTU size and server GUID in connection state
+        if (connection.state) {
+            connection.state.mtuSize = mtuSize;
+            connection.state.serverGuid = serverGuid;
+            connection.state.security = security === 1;
+        }
+        
+        // Now send an open connection request 2
+        sendOpenConnectionRequest2(connectionId);
+    } catch (error) {
+        console.error(`[ERROR] Error handling open connection reply 1: ${error.message}`);
+    }
+}
+function sendOpenConnectionRequest2(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create an open connection request 2 packet
+        const buffer = Buffer.alloc(1500);
+        let offset = 0;
+        
+        // Packet ID for open connection request 2 (0x07)
+        buffer.writeUInt8(0x07, offset++);
+        
+        // Magic (16 bytes)
+        const magic = Buffer.from([0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78]);
+        magic.copy(buffer, offset);
+        offset += 16;
+        
+        // Server address
+        const serverIp = connection.state.serverAddress.split('.');
+        buffer.writeUInt8(4, offset++); // IPv4
+        buffer.writeUInt8(parseInt(serverIp[0]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[1]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[2]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[3]), offset++);
+        buffer.writeUInt16BE(connection.state.serverPort, offset);
+        offset += 2;
+        
+        // MTU size
+        buffer.writeUInt16BE(connection.state.mtuSize, offset);
+        offset += 2;
+        
+        // Client GUID
+        buffer.writeBigUInt64BE(connection.state.clientGuid, offset);
+        offset += 8;
+        
+        // Send the packet
+        connection.client.send(buffer.slice(0, offset), connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send open connection request 2: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent open connection request 2 to ${connection.state.serverAddress}:${connection.state.serverPort}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating open connection request 2 packet: ${error.message}`);
+    }
+}
+
+// Function to handle open connection reply 2
+function handleOpenConnectionReply2(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Parse the open connection reply 2 packet
+        let offset = 1; // Skip packet ID
+        
+        // Skip magic (16 bytes)
+        offset += 16;
+        
+        // Read server GUID
+        const serverGuid = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Read client address
+        const addressType = data.readUInt8(offset++);
+        offset += addressType === 4 ? 6 : 18; // Skip client address (4 bytes for IPv4 + 2 for port, or 16 bytes for IPv6 + 2 for port)
+        
+        // Read MTU size
+        const mtuSize = data.readUInt16BE(offset);
+        offset += 2;
+        
+        // Read encryption
+        const encryption = data.readUInt8(offset++);
+        
+        console.log(`[INFO] Received open connection reply 2: MTU size = ${mtuSize}, Encryption = ${encryption}`);
+        
+        // Store MTU size and server GUID in connection state
+        if (connection.state) {
+            connection.state.mtuSize = mtuSize;
+            connection.state.serverGuid = serverGuid;
+            connection.state.encryption = encryption === 1;
+        }
+        
+        // Now send a connection request
+        sendConnectionRequest(connectionId);
+    } catch (error) {
+        console.error(`[ERROR] Error handling open connection reply 2: ${error.message}`);
+    }
+}
+
+// Function to send a connection request
+// Remove the duplicate function and keep only this improved version
+function sendConnectionRequest(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create a connection request packet
+        const buffer = Buffer.alloc(1500);
+        let offset = 0;
+        
+        // Packet ID for connection request (0x09)
+        buffer.writeUInt8(0x09, offset++);
+        
+        // Client GUID
+        buffer.writeBigUInt64BE(connection.state.clientGuid, offset);
+        offset += 8;
+        
+        // Timestamp
+        const timestamp = BigInt(Date.now());
+        buffer.writeBigUInt64BE(timestamp, offset);
+        offset += 8;
+        
+        // Security
+        buffer.writeUInt8(0, offset++); // No security
+        
+        // Send the packet
+        connection.client.send(buffer.slice(0, offset), connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send connection request: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent connection request to ${connection.state.serverAddress}:${connection.state.serverPort}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating connection request packet: ${error.message}`);
+    }
+}
+
+// Function to handle connection request accepted
+function handleConnectionRequestAccepted(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Parse connection request accepted
+        let offset = 1; // Skip packet ID
+        
+        // Read server address
+        const addressType = data.readUInt8(offset++);
+        let serverAddress;
+        
+        if (addressType === 4) { // IPv4
+            serverAddress = `${data.readUInt8(offset++)}.${data.readUInt8(offset++)}.${data.readUInt8(offset++)}.${data.readUInt8(offset++)}`;
+            const serverPort = data.readUInt16BE(offset);
+            offset += 2;
+            
+            console.log(`[INFO] Server address: ${serverAddress}:${serverPort}`);
+        } else if (addressType === 6) { // IPv6
+            // Skip IPv6 implementation for now
+            offset += 16;
+            const serverPort = data.readUInt16BE(offset);
+            offset += 2;
+        }
+        
+        // Read client address (our address)
+        const clientAddressType = data.readUInt8(offset++);
+        offset += clientAddressType === 4 ? 6 : 18; // Skip client address (4 bytes for IPv4 + 2 for port, or 16 bytes for IPv6 + 2 for port)
+        
+        // Read system addresses (20 of them in the packet)
+        for (let i = 0; i < 20; i++) {
+            const systemAddressType = data.readUInt8(offset++);
+            offset += systemAddressType === 4 ? 6 : 18; // Skip system address
+        }
+        
+        // Read server timestamp
+        const serverTimestamp = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Read client timestamp
+        const clientTimestamp = data.readBigUInt64BE(offset);
+        offset += 8;
+        
+        // Store timestamps in connection state
+        connection.state.serverTimestamp = serverTimestamp;
+        connection.state.clientTimestamp = clientTimestamp;
+        
+        console.log(`[INFO] Connection request accepted from ${rinfo.address}:${rinfo.port}`);
+        
+        // Send a new connection request with security
+        sendNewIncomingConnection(connectionId, rinfo);
+    } catch (error) {
+        console.error(`[ERROR] Error handling connection request accepted: ${error.message}`);
+    }
+}
+function sendNewIncomingConnection(connectionId, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    const { client, state } = connection;
+    
+    try {
+        // Create a new incoming connection packet
+        // Packet ID for new incoming connection is 0x13
+        const buffer = Buffer.alloc(1500);
+        let offset = 0;
+        
+        // Packet ID
+        buffer.writeUInt8(0x13, offset++);
+        
+        // Server address
+        buffer.writeUInt8(4, offset++); // IPv4
+        const serverIp = rinfo.address.split('.');
+        buffer.writeUInt8(parseInt(serverIp[0]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[1]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[2]), offset++);
+        buffer.writeUInt8(parseInt(serverIp[3]), offset++);
+        buffer.writeUInt16BE(rinfo.port, offset);
+        offset += 2;
+        
+        // System addresses (20 of them)
+        for (let i = 0; i < 20; i++) {
+            buffer.writeUInt8(4, offset++); // IPv4
+            buffer.writeUInt8(0, offset++);
+            buffer.writeUInt8(0, offset++);
+            buffer.writeUInt8(0, offset++);
+            buffer.writeUInt8(0, offset++);
+            buffer.writeUInt16BE(0, offset);
+            offset += 2;
+        }
+        
+        // Server timestamp
+        buffer.writeBigUInt64BE(state.serverTimestamp || BigInt(0), offset);
+        offset += 8;
+        
+        // Client timestamp
+        buffer.writeBigUInt64BE(state.clientTimestamp || BigInt(0), offset);
+        offset += 8;
+        
+        // Send the packet
+        client.send(buffer.slice(0, offset), state.serverPort, state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send new incoming connection: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent new incoming connection to ${state.serverAddress}:${state.serverPort}`);
+                
+                // After sending this, we should start sending ACK packets and handling game packets
+                startReliablePacketHandling(connectionId);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating new incoming connection packet: ${error.message}`);
+    }
+}
+
+// Function to start reliable packet handling
+function startReliablePacketHandling(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    // Set up ACK interval
+    const ackInterval = setInterval(() => {
+        sendACK(connectionId);
+    }, 100); // Send ACK every 100ms
+    
+    // Store the interval ID for cleanup
+    connection.state.ackInterval = ackInterval;
+    
+    // Update connection status
+    connection.status = 'connected';
+    
+    // Add chat message about successful connection
+    addChatMessage(connectionId, 'system', `Connected to ${connection.serverAddress}:${connection.serverPort}`);
+    
+    // Start the login sequence
+    startLoginSequence(connectionId);
+}
+
+// Function to send ACK packets
+function sendACK(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    const { client, state } = connection;
+    
+    // Only send ACK if we have received packets
+    if (state.lastReceivedSequence < 0) return;
+    
+    // Create an ACK packet
+    // Packet ID for ACK is 0xC0
+    const buffer = Buffer.alloc(32);
+    let offset = 0;
+    
+    // Packet ID
+    buffer.writeUInt8(0xC0, offset++);
+    
+    // Number of ACK ranges
+    buffer.writeUInt16BE(1, offset);
+    offset += 2;
+    
+    // ACK range (start sequence number)
+    buffer.writeUInt24BE(state.lastReceivedSequence, offset);
+    offset += 3;
+    
+    // ACK range (end sequence number)
+    buffer.writeUInt24BE(state.lastReceivedSequence, offset);
+    offset += 3;
+    
+    // Send the packet
+    client.send(buffer.slice(0, offset), state.serverPort, state.serverAddress, (err) => {
+        if (err) {
+            console.error(`[ERROR] Failed to send ACK: ${err.message}`);
+        }
+    });
+}
+
+// Function to start the login sequence
+async function startLoginSequence(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    console.log(`[INFO] Starting login sequence for ${connection.username}`);
+    
+    // Send login packet
+    await sendLoginPacket(connectionId);
+}
+
+// Function to send login packet
+async function sendLoginPacket(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    const { client, state, username } = connection;
+    
+    try {
+        // First, create the login payload
+        const loginPayload = await createLoginPayload(username, state.clientGuid);
+        
+        // Then wrap it in a reliable packet
+        const reliablePacket = wrapInReliablePacket(loginPayload, state.reliableFrameIndex++);
+        
+        // Send the packet
+        client.send(reliablePacket, state.serverPort, state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send login packet: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent login packet for ${username}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating login packet: ${error.message}`);
+    }
+}
+
+// Function to create login payload
+async function createLoginPayload(username, clientGuid) {
+    const connection = connections.find(conn => conn.state && conn.state.clientGuid === clientGuid);
+    
+    try {
+        // Create a buffer for the login packet
+        const buffer = Buffer.alloc(4096); // Larger buffer for JWT tokens
+        let offset = 0;
+        
+        // Packet ID for login
+        buffer.writeUInt8(0x01, offset++);
+        
+        // Protocol version
+        buffer.writeInt32BE(582, offset); // Updated protocol version for Bedrock 1.20
+        offset += 4;
+        
+        // Payload length placeholder
+        const payloadLengthOffset = offset;
+        offset += 4;
+        
+        // Start of payload
+        const payloadStartOffset = offset;
+        
+        let chainData;
+        
+        if (connection && connection.msaAccessToken) {
+            console.log('[INFO] Using Microsoft authentication for login');
+            
+            // Get Xbox Live tokens using the Microsoft access token
+            const xboxData = await getXboxTokens(connection.msaAccessToken);
+            
+            if (!xboxData || !xboxData.identityToken || !xboxData.xboxUsername) {
+                throw new Error('Failed to get Xbox Live tokens');
+            }
+            
+            // Create the chain data with Xbox Live tokens
+            chainData = {
+                chain: [
+                    xboxData.identityToken
+                ]
+            };
+            
+            // Set the Xbox username
+            username = xboxData.xboxUsername;
+        } else {
+            console.log('[INFO] Using offline mode for login');
+            // For offline mode, use an empty chain
+            chainData = {
+                chain: []
+            };
+        }
+        
+        // Convert chain data to JSON string
+        const chainDataStr = JSON.stringify(chainData);
+        
+        // Write the chain data length
+        buffer.writeUInt32LE(chainDataStr.length, offset);
+        offset += 4;
+        
+        // Write the chain data
+        buffer.write(chainDataStr, offset);
+        offset += chainDataStr.length;
+        
+        // Create client data JWT
+        const clientData = {
+            ClientRandomId: Math.floor(Math.random() * 10000000000),
+            ServerAddress: connection ? `${connection.serverAddress}:${connection.serverPort}` : "",
+            SkinId: crypto.randomUUID().replace(/-/g, ""),
+            SkinResourcePatch: JSON.stringify({
+                geometry: { default: "geometry.humanoid.custom" }
+            }),
+            ThirdPartyName: username,
+            SelfSignedId: crypto.randomUUID().replace(/-/g, ""),
+            DeviceModel: "PC",
+            DeviceOS: 7, // Windows
+            GameVersion: "1.20.0",
+            GuiScale: 0,
+            LanguageCode: "en_US"
+        };
+        
+        // Convert client data to JWT
+        const clientDataJWT = JSON.stringify(clientData);
+        
+        // Write client data JWT length
+        buffer.writeUInt32LE(clientDataJWT.length, offset);
+        offset += 4;
+        
+        // Write client data JWT
+        buffer.write(clientDataJWT, offset);
+        offset += clientDataJWT.length;
+        
+        // Update payload length
+        const payloadLength = offset - payloadStartOffset;
+        buffer.writeUInt32LE(payloadLength, payloadLengthOffset);
+        
+        return buffer.slice(0, offset);
+    } catch (error) {
+        console.error(`[ERROR] Error creating login payload: ${error.message}`);
+        throw error;
+    }
+}
+
+// Helper function to get Xbox Live tokens
+async function getXboxTokens(msAccessToken) {
+    try {
+        console.log('[AUTH] Getting Xbox Live tokens...');
+        
+        // Step 1: Authenticate with Xbox Live
+        const xblResponse = await fetch('https://user.auth.xboxlive.com/user/authenticate', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+                Properties: {
+                    AuthMethod: 'RPS',
+                    SiteName: 'user.auth.xboxlive.com',
+                    RpsTicket: `d=${msAccessToken}`
+                },
+                RelyingParty: 'http://auth.xboxlive.com',
+                TokenType: 'JWT'
+            })
+        });
+        
+        const xblData = await xblResponse.json();
+        
+        if (!xblData.Token) {
+            throw new Error('Failed to get Xbox Live token');
+        }
+        
+        const xblToken = xblData.Token;
+        const userHash = xblData.DisplayClaims.xui[0].uhs;
+        
+        console.log('[AUTH] Xbox Live authentication successful');
+        
+        // Step 2: Authenticate with XSTS
+        const xstsResponse = await fetch('https://xsts.auth.xboxlive.com/xsts/authorize', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            },
+            body: JSON.stringify({
+                Properties: {
+                    SandboxId: 'RETAIL',
+                    UserTokens: [xblToken]
+                },
+                RelyingParty: 'rp://api.minecraftservices.com/',
+                TokenType: 'JWT'
+            })
+        });
+        
+        const xstsData = await xstsResponse.json();
+        
+        if (xstsData.XErr) {
+            const errorCode = xstsData.XErr;
+            let errorMessage = 'Xbox Live authentication failed';
+            
+            if (errorCode === 2148916233) {
+                errorMessage = 'The account does not have an Xbox profile';
+            } else if (errorCode === 2148916238) {
+                errorMessage = 'The account is from a country where Xbox Live is not available';
+            }
+            
+            throw new Error(errorMessage);
+        }
+        
+        if (!xstsData.Token) {
+            throw new Error('Failed to get XSTS token');
+        }
+        
+        const xstsToken = xstsData.Token;
+        const xboxUsername = xstsData.DisplayClaims.xui[0].gtg || 'Unknown';
+        
+        console.log(`[AUTH] XSTS authentication successful for ${xboxUsername}`);
+        
+        // Step 3: Create the identity token for Minecraft
+        const identityToken = `XBL3.0 x=${userHash};${xstsToken}`;
+        
+        return {
+            identityToken,
+            xboxUsername
+        };
+    } catch (error) {
+        console.error(`[AUTH] Error getting Xbox tokens: ${error.message}`);
+        return null;
+    }
+}
+
+// Function to wrap payload in a reliable packet
+function wrapInReliablePacket(payload, reliableFrameIndex) {
+    const buffer = Buffer.alloc(payload.length + 16);
+    let offset = 0;
+    
+    // Packet ID for reliable packet (0x84)
+    buffer.writeUInt8(0x84, offset++);
+    
+    // Reliable frame index
+    buffer.writeUInt24BE(reliableFrameIndex, offset);
+    offset += 3;
+    
+    // Copy payload
+    payload.copy(buffer, offset);
+    offset += payload.length;
+    
+    return buffer.slice(0, offset);
+}
+
+// Helper function to write 24-bit integers (not natively supported in Node.js)
+Buffer.prototype.writeUInt24BE = function(value, offset) {
+    this.writeUInt8((value >> 16) & 0xFF, offset);
+    this.writeUInt8((value >> 8) & 0xFF, offset + 1);
+    this.writeUInt8(value & 0xFF, offset + 2);
+    return offset + 3;
+};
+
+// Update the handleBedrockPacket function to handle more packet types
+function handleBedrockPacket(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    connection.lastActivity = Date.now();
+    
+    try {
+        // Read packet ID (first byte)
+        const packetId = data.readUInt8(0);
+        
+        console.log(`[DEBUG] Received packet with ID: 0x${packetId.toString(16)} from ${rinfo.address}:${rinfo.port}`);
+        
+        // Handle different packet types
+        switch (packetId) {
+            case 0x1C: // Unconnected Pong
+                handleUnconnectedPong(connectionId, data, rinfo);
+                break;
+            case 0x06: // Open Connection Reply 1
+                handleOpenConnectionReply1(connectionId, data, rinfo);
+                break;
+            case 0x08: // Open Connection Reply 2
+                handleOpenConnectionReply2(connectionId, data, rinfo);
+                break;
+            case 0x10: // Connection Request Accepted
+                handleConnectionRequestAccepted(connectionId, data, rinfo);
+                break;
+            case 0xA0: // NACK (Negative Acknowledgement)
+                // Handle NACK - resend packets
+                break;
+            case 0xC0: // ACK (Acknowledgement)
+                // Handle ACK - mark packets as received
+                break;
+            case 0x80: // Regular packet
+            case 0x84: // Reliable packet
+            case 0x88: // Ordered packet
+            case 0x8C: // Reliable ordered packet
+                // Handle game packets
+                handleGamePacket(connectionId, data, rinfo);
+                break;
+            default:
+                console.log(`[DEBUG] Unhandled packet type: 0x${packetId.toString(16)}`);
+        }
+    } catch (error) {
+        console.error(`[ERROR] Error handling packet: ${error.message}`);
+    }
+}
+
+// Function to handle game packets
+function handleGamePacket(connectionId, data, rinfo) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Extract the game packet from the reliable packet
+        const packetId = data.readUInt8(0);
+        let offset = 1;
+        
+        // If it's a reliable packet, skip the reliable frame index
+        if (packetId === 0x84 || packetId === 0x8C) {
+            // Skip reliable frame index (3 bytes)
+            offset += 3;
+        }
+        
+        // If it's an ordered packet, skip the ordered index and channel
+        if (packetId === 0x88 || packetId === 0x8C) {
+            // Skip ordered index (3 bytes) and channel (1 byte)
+            offset += 4;
+        }
+        
+        // Now we're at the game packet payload
+        // Read the game packet ID
+        const gamePacketId = data.readUInt8(offset++);
+        
+        console.log(`[DEBUG] Received game packet with ID: 0x${gamePacketId.toString(16)}`);
+        
+        // Update the last received sequence number for ACK packets
+        if (connection.state) {
+            connection.state.lastReceivedSequence = Math.max(
+                connection.state.lastReceivedSequence || 0,
+                packetId === 0x84 || packetId === 0x8C ? 
+                    (data.readUInt8(1) << 16) | (data.readUInt8(2) << 8) | data.readUInt8(3) : 0
+            );
+        }
+        
+        // Handle different game packet types
+        switch (gamePacketId) {
+            case 0x02: // Play Status
+                const status = data.readInt32BE(offset);
+                console.log(`[INFO] Received Play Status: ${status}`);
+                
+                if (status === 0) { // Login Success
+                    console.log(`[INFO] Login successful for ${connection.username}`);
+                    connection.status = 'connected';
+                    addChatMessage(connectionId, 'system', `Login successful as ${connection.username}`);
+                    
+                    // Send request to spawn
+                    sendRequestChunkRadius(connectionId);
+                } else if (status === 1) { // Login Failed (Server Full)
+                    console.log(`[INFO] Login failed: Server full`);
+                    connection.status = 'error';
+                    connection.error = 'Server full';
+                    addChatMessage(connectionId, 'system', `Login failed: Server full`);
+                } else if (status === 2) { // Login Failed (Invalid Game Version)
+                    console.log(`[INFO] Login failed: Invalid game version`);
+                    connection.status = 'error';
+                    connection.error = 'Invalid game version';
+                    addChatMessage(connectionId, 'system', `Login failed: Invalid game version`);
+                } else if (status === 3) { // Login Failed (Invalid Tenant)
+                    console.log(`[INFO] Login failed: Invalid tenant`);
+                    connection.status = 'error';
+                    connection.error = 'Invalid tenant';
+                    addChatMessage(connectionId, 'system', `Login failed: Invalid tenant`);
+                } else if (status === 4) { // Already Logged In
+                    console.log(`[INFO] Already logged in as ${connection.username}`);
+                    // This is not necessarily an error, just a notification
+                    addChatMessage(connectionId, 'system', `Already logged in as ${connection.username}`);
+                }
+                break;
+                
+            case 0x03: // Server To Client Handshake
+                console.log(`[INFO] Received Server To Client Handshake`);
+                // Handle encryption if needed
+                // For now, we'll skip encryption and just acknowledge
+                sendClientToServerHandshake(connectionId);
+                break;
+                
+            case 0x05: // Disconnect
+                // Read disconnect reason
+                const reasonLength = data.readUInt16BE(offset);
+                offset += 2;
+                const reason = data.toString('utf8', offset, offset + reasonLength);
+                
+                console.log(`[INFO] Disconnected from server: ${reason}`);
+                connection.status = 'disconnected';
+                connection.disconnectReason = reason;
+                addChatMessage(connectionId, 'system', `Disconnected: ${reason}`);
+                
+                // Clean up resources
+                cleanupConnection(connectionId);
+                break;
+                
+            case 0x07: // Resource Packs Info
+                console.log(`[INFO] Received Resource Packs Info`);
+                // Send resource packs client response (we don't need any resource packs)
+                sendResourcePacksResponse(connectionId);
+                break;
+                
+            case 0x0A: // Text (Chat)
+                // Handle chat message
+                handleChatMessage(connectionId, data, offset);
+                break;
+                
+            case 0x0B: // Set Time
+                const time = data.readInt32BE(offset);
+                console.log(`[INFO] Server time set to: ${time}`);
+                break;
+                
+            case 0x0C: // Start Game
+                console.log(`[INFO] Received Start Game packet`);
+                handleStartGame(connectionId, data, offset);
+                break;
+                
+            case 0x3A: // Chunk Data
+                // Handle chunk data (for rendering the world)
+                // This is complex and we'll just acknowledge receipt
+                console.log(`[DEBUG] Received chunk data`);
+                break;
+                
+            case 0x8F: // Available Commands
+                console.log(`[INFO] Received available commands`);
+                // Parse available commands if needed
+                break;
+                
+            default:
+                // Other game packets - would need to implement as needed
+                console.log(`[DEBUG] Unhandled game packet type: 0x${gamePacketId.toString(16)}`);
+                break;
+        }
+    } catch (error) {
+        console.error(`[ERROR] Error handling game packet: ${error.message}`);
+    }
+}
+
+// Function to handle chat messages
+function handleChatMessage(connectionId, data, offset) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Read message type
+        const messageType = data.readUInt8(offset++);
+        
+        // Skip unused fields
+        offset += 1; // Skip needs translation flag
+        
+        // Read sender
+        const senderLength = data.readUInt16BE(offset);
+        offset += 2;
+        const sender = data.toString('utf8', offset, offset + senderLength);
+        offset += senderLength;
+        
+        // Read message
+        const messageLength = data.readUInt16BE(offset);
+        offset += 2;
+        const message = data.toString('utf8', offset, offset + messageLength);
+        
+        console.log(`[CHAT] ${sender}: ${message}`);
+        addChatMessage(connectionId, sender, message);
+    } catch (error) {
+        console.error(`[ERROR] Error handling chat message: ${error.message}`);
+    }
+}
+function handleStartGame(connectionId, data, offset) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    try {
+        // Parse the Start Game packet
+        // This packet contains a lot of information about the game world
+        // For simplicity, we'll just extract the entity ID and position
+        
+        // Entity ID (runtime ID)
+        const entityId = data.readVarInt(offset);
+        offset = data.lastReadVarIntSize;
+        
+        // Skip runtime entity ID
+        offset = data.readVarInt(offset) + data.lastReadVarIntSize;
+        
+        // Game mode
+        const gameMode = data.readVarInt(offset);
+        offset = data.lastReadVarIntSize;
+        
+        // Player position
+        const posX = data.readFloatLE(offset);
+        offset += 4;
+        const posY = data.readFloatLE(offset);
+        offset += 4;
+        const posZ = data.readFloatLE(offset);
+        offset += 4;
+        
+        console.log(`[INFO] Player spawned at position: ${posX.toFixed(2)}, ${posY.toFixed(2)}, ${posZ.toFixed(2)}`);
+        console.log(`[INFO] Game mode: ${gameMode}`);
+        
+        // Store entity ID and position in connection state
+        if (connection.state) {
+            connection.state.entityId = entityId;
+            connection.state.position = { x: posX, y: posY, z: posZ };
+            connection.state.gameMode = gameMode;
+        }
+        
+        // Send player ready to spawn
+        sendPlayerReady(connectionId);
+    } catch (error) {
+        console.error(`[ERROR] Error handling Start Game packet: ${error.message}`);
+    }
+}
+function sendClientToServerHandshake(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create a Client To Server Handshake packet
+        const buffer = Buffer.alloc(5);
+        let offset = 0;
+        
+        // Game packet ID for Client To Server Handshake is 0x04
+        buffer.writeUInt8(0x04, offset++);
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send Client To Server Handshake: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent Client To Server Handshake`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating Client To Server Handshake packet: ${error.message}`);
+    }
+}
+function sendResourcePacksResponse(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create a Resource Packs Response packet
+        const buffer = Buffer.alloc(5);
+        let offset = 0;
+        
+        // Game packet ID for Resource Packs Response is 0x08
+        buffer.writeUInt8(0x08, offset++);
+        
+        // Response status (0 = No packs needed)
+        buffer.writeUInt8(0x03, offset++);
+        
+        // Pack IDs count (0)
+        buffer.writeUInt16LE(0, offset);
+        offset += 2;
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send Resource Packs Response: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent Resource Packs Response`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating Resource Packs Response packet: ${error.message}`);
+    }
+}
+
+// Function to send Request Chunk Radius
+function sendRequestChunkRadius(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create a Request Chunk Radius packet
+        const buffer = Buffer.alloc(5);
+        let offset = 0;
+        
+        // Game packet ID for Request Chunk Radius is 0x45
+        buffer.writeUInt8(0x45, offset++);
+        
+        // Chunk radius (8 chunks)
+        buffer.writeInt32LE(8, offset);
+        offset += 4;
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send Request Chunk Radius: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent Request Chunk Radius`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating Request Chunk Radius packet: ${error.message}`);
+    }
+}
+
+// Function to send Player Ready
+function sendPlayerReady(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client) return;
+    
+    try {
+        // Create a Player Ready packet (SetLocalPlayerAsInitialized)
+        const buffer = Buffer.alloc(5);
+        let offset = 0;
+        
+        // Game packet ID for SetLocalPlayerAsInitialized is 0x71
+        buffer.writeUInt8(0x71, offset++);
+        
+        // Runtime entity ID
+        buffer.writeVarInt(connection.state.entityId || 0, offset);
+        offset += buffer.lastWrittenVarIntSize;
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send Player Ready: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent Player Ready`);
+                
+                // Now we're fully connected and can start sending movement packets
+                connection.status = 'connected';
+                addChatMessage(connectionId, 'system', `Fully connected to the server`);
+                
+                // Start sending movement packets
+                startSendingMovementPackets(connectionId);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating Player Ready packet: ${error.message}`);
+    }
+}
+
+// Function to start sending movement packets
+function startSendingMovementPackets(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    // Set up movement interval
+    const movementInterval = setInterval(() => {
+        sendMovementPacket(connectionId);
+    }, 1000); // Send movement every second
+    
+    // Store the interval ID for cleanup
+    connection.state.movementInterval = movementInterval;
+}
+
+// Function to send movement packet
+function sendMovementPacket(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client || connection.status !== 'connected') return;
+    
+    try {
+        // Create a MovePlayer packet
+        const buffer = Buffer.alloc(32);
+        let offset = 0;
+        
+        // Game packet ID for MovePlayer is 0x13
+        buffer.writeUInt8(0x13, offset++);
+        
+        // Runtime entity ID
+        buffer.writeVarInt(connection.state.entityId || 0, offset);
+        offset += buffer.lastWrittenVarIntSize;
+        
+        // Position
+        const pos = connection.state.position || { x: 0, y: 0, z: 0 };
+        buffer.writeFloatLE(pos.x, offset);
+        offset += 4;
+        buffer.writeFloatLE(pos.y + 1.62, offset); // Eye height
+        offset += 4;
+        buffer.writeFloatLE(pos.z, offset);
+        offset += 4;
+        
+        // Rotation (pitch, yaw, head yaw)
+        buffer.writeFloatLE(0, offset); // Pitch
+        offset += 4;
+        buffer.writeFloatLE(0, offset); // Yaw
+        offset += 4;
+        buffer.writeFloatLE(0, offset); // Head Yaw
+        offset += 4;
+        
+        // Mode (0 = normal)
+        buffer.writeUInt8(0, offset++);
+        
+        // On ground
+        buffer.writeUInt8(1, offset++);
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send Movement packet: ${err.message}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating Movement packet: ${error.message}`);
+    }
+}
+
+// Function to send chat message to the server
+function sendChatMessage(connectionId, message) {
+    const connection = connections[connectionId];
+    if (!connection || !connection.client || connection.status !== 'connected') return;
+    
+    try {
+        // Create a Text packet
+        const buffer = Buffer.alloc(512);
+        let offset = 0;
+        
+        // Game packet ID for Text is 0x0A
+        buffer.writeUInt8(0x0A, offset++);
+        
+        // Type (1 = chat message)
+        buffer.writeUInt8(1, offset++);
+        
+        // Needs translation (0 = false)
+        buffer.writeUInt8(0, offset++);
+        
+        // Source name (empty for client messages)
+        buffer.writeUInt16LE(0, offset);
+        offset += 2;
+        
+        // Message
+        buffer.writeUInt16LE(message.length, offset);
+        offset += 2;
+        buffer.write(message, offset);
+        offset += message.length;
+        
+        // Xuid (empty)
+        buffer.writeUInt16LE(0, offset);
+        offset += 2;
+        
+        // Platform chat ID (empty)
+        buffer.writeUInt16LE(0, offset);
+        offset += 2;
+        
+        // Wrap in reliable packet
+        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        
+        // Send the packet
+        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+            if (err) {
+                console.error(`[ERROR] Failed to send chat message: ${err.message}`);
+            } else {
+                console.log(`[INFO] Sent chat message: ${message}`);
+            }
+        });
+    } catch (error) {
+        console.error(`[ERROR] Error creating chat message packet: ${error.message}`);
+    }
+}
+
+// Function to clean up connection resources
+function cleanupConnection(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    // Clear intervals
+    if (connection.state) {
+        if (connection.state.ackInterval) {
+            clearInterval(connection.state.ackInterval);
+            connection.state.ackInterval = null;
+        }
+        
+        if (connection.state.movementInterval) {
+            clearInterval(connection.state.movementInterval);
+            connection.state.movementInterval = null;
+        }
+    }
+    
+    // Close UDP socket
+    if (connection.client) {
+        try {
+            connection.client.close();
+        } catch (error) {
+            console.error(`[ERROR] Error closing UDP socket: ${error.message}`);
+        }
+        connection.client = null;
+    }
+    
+    console.log(`[INFO] Cleaned up resources for connection ${connectionId}`);
+}
+
+// Add VarInt reading/writing methods to Buffer prototype
+Buffer.prototype.readVarInt = function(offset) {
+    let value = 0;
+    let currentByte;
+    let byteOffset = 0;
+    let isNegative = false;
+    
+    do {
+        currentByte = this.readUInt8(offset + byteOffset);
+        
+        // Extract the 7 bits of data from the byte
+        const byteValue = currentByte & 0x7F;
+        value |= byteValue << (7 * byteOffset);
+        
+        byteOffset++;
+        
+        // Check if we've read too many bytes
+        if (byteOffset > 5) {
+            throw new Error('VarInt is too big');
+        }
+    } while ((currentByte & 0x80) !== 0);
+    
+    // Store how many bytes we read
+    this.lastReadVarIntSize = byteOffset;
+    
+    return value;
+};
+
+Buffer.prototype.writeVarInt = function(value, offset) {
+    let byteOffset = 0;
+    
+    do {
+        let byte = value & 0x7F;
+        value >>>= 7;
+        
+        if (value !== 0) {
+            byte |= 0x80;
+        }
+        
+        this.writeUInt8(byte, offset + byteOffset);
+        byteOffset++;
+        
+        // Check if we've written too many bytes
+        if (byteOffset > 5) {
+            throw new Error('VarInt is too big');
+        }
+    } while (value !== 0);
+    
+    // Store how many bytes we wrote
+    this.lastWrittenVarIntSize = byteOffset;
+    
+    return offset + byteOffset;
+};
+
+// Update the connectBedrockClient function to initialize the state properly
+async function connectBedrockClient(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) {
+        console.error(`[ERROR] Connection ${connectionId} not found`);
+        return;
+    }
+    
+    try {
+        console.log(`[INFO] Connecting to Bedrock server ${connection.serverAddress}:${connection.serverPort} as ${connection.username}`);
+        
+        // Check if Microsoft authentication is needed
+        if (connection.useMicrosoftAuth) {
+            console.log(`[INFO] Using Microsoft authentication for Bedrock`);
+            
+            // Make sure we have a token
+            if (!bedrockMsaAccessToken) {
+                console.error(`[ERROR] No Microsoft access token available for Bedrock`);
+                connection.status = 'error';
+                connection.error = 'No Microsoft access token available';
+                return false;
+            }
+            
+            // Store the token for later use in the login packet
+            connection.msaAccessToken = bedrockMsaAccessToken;
+            connection.xboxUsername = bedrockXboxUsername;
+        }
+        
+        // Create a UDP socket
+        const dgram = require('dgram');
+        const client = dgram.createSocket('udp4');
+        
+        // Store client reference
+        connection.client = client;
+        connection.status = 'connecting';
+        connection.lastActivity = Date.now();
+        connection.startTime = Date.now();
+        
+        // Set up connection state
+        const connectionState = {
+            serverAddress: connection.serverAddress,
+            serverPort: parseInt(connection.serverPort),
+            username: connection.username,
+            clientGuid: crypto.randomBytes(8).readBigUInt64BE(0),
+            mtuSize: 1400, // Default MTU size
+            reliableFrameIndex: 0,
+            splitPacketCounter: 0,
+            fragmentedPackets: new Map(),
+            sequenceNumber: 0,
+            lastReceivedSequence: -1,
+            encryptionEnabled: false,
+            authenticated: false,
+            entityId: 0,
+            position: { x: 0, y: 0, z: 0 },
+            gameMode: 0
+        };
+        
+        // Store connection state
+        connection.state = connectionState;
+        
+        // Set up event handlers for the UDP socket
+        client.on('message', (msg, rinfo) => {
+            handleBedrockPacket(connectionId, msg, rinfo);
+        });
+        
+        client.on('error', (err) => {
+            console.error(`[ERROR] Bedrock client socket error: ${err.message}`);
+            connection.status = 'error';
+            connection.error = err.message;
+            addChatMessage(connectionId, 'system', `Error: ${err.message}`);
+        });
+        
+        client.on('close', () => {
+            console.log(`[INFO] Bedrock client socket closed`);
+            connection.status = 'disconnected';
+            addChatMessage(connectionId, 'system', 'Connection closed');
+        });
+        
+        // Bind the socket to a random port
+        client.bind(0, () => {
+            console.log(`[INFO] UDP socket bound to port ${client.address().port}`);
+            
+            // Start the connection process by sending an unconnected ping
+            sendUnconnectedPing(connectionId);
+        });
+        
+        // Store the connection in activeConnections for later use
+        activeConnections.set(connectionId, {
+            client: client,
+            edition: 'bedrock',
+            username: connection.username,
+            serverAddress: connection.serverAddress,
+            serverPort: connection.serverPort,
+            messages: [],
+            startTime: Date.now()
+        });
+        
+        return true;
+    } catch (error) {
+        console.error(`[ERROR] Failed to connect Bedrock client: ${error.message}`, error.stack);
+        connection.status = 'error';
+        connection.error = `Failed to initialize connection: ${error.message}`;
+        return false;
+    }
+}
