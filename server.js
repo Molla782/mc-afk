@@ -15,7 +15,6 @@ const bedrock = require('bedrock-protocol');
 const crypto = require('crypto');
 const fs = require('fs');
 const https = require('https');
-const crypto = require('crypto');
 const { Buffer } = require('buffer');
 
 const sessionPassword = crypto.randomBytes(8).toString('hex'); // 16-char hex
