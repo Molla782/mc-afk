@@ -1097,24 +1097,10 @@ async function connectBedrockClient(connectionId) {
         if (useAuthentication) {
             console.log(`[INFO] Using authenticated mode for Bedrock connection`);
             
-            // Find the account in the server-side bedrockAccounts array
-            const account = bedrockAccounts.find(acc => acc.username === connection.username);
-            
-            if (!account || !account.accessToken) {
-                console.error(`[ERROR] Could not find authenticated account data (or token) for ${connection.username} on server.`);
-                connection.status = 'error';
-                connection.error = 'Authentication failed: Server-side account data not found or incomplete. Please re-add the account.';
-                return false;
-            }
-            
-            // Set up the authentication flow options
+            // Instead of using our custom authentication, let bedrock-protocol handle it
             clientOptions.offline = false;
             clientOptions.authTitle = true;
-            
-            // Use the correct flow type - "live" is the standard Microsoft authentication flow
             clientOptions.auth = 'msa';
-            clientOptions.accessToken = account.accessToken;
-            clientOptions.flow = 'live';
             
             // Create a cache folder for tokens if it doesn't exist
             const profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
@@ -1125,7 +1111,7 @@ async function connectBedrockClient(connectionId) {
             // Add profiles folder for token caching
             clientOptions.profilesFolder = profilesFolder;
             
-            console.log(`[INFO] Using authenticated mode with Minecraft access token and flow: ${clientOptions.flow}`);
+            console.log(`[INFO] Using bedrock-protocol's built-in Microsoft authentication`);
             
             // Store the connection in activeConnections for later use
             activeConnections.set(connectionId, {
@@ -1288,8 +1274,7 @@ app.post('/api/minecraft/request-auth', (req, res) => {
     
     const redirectUri = `https://www.snowwysmp.net:${port}`;
     
-    const authUrl = `https://login.live.com/oauth20_authorize.srf?client_id=${clientId}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=XboxLive.signin%20offline_access&prompt=select_account&login_hint=optional`;   
-    if (authServer) {
+    const authUrl = `https://login.live.com/oauth20_authorize.srf?client_id=${clientId}&response_type=code&redirect_uri=${encodeURIComponent(redirectUri)}&scope=XboxLive.signin%20offline_access&prompt=select_account&login_hint=optional`;     if (authServer) {
         try {
             authServer.close();
             console.log('Closed existing auth server');
