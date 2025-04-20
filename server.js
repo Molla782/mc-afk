@@ -1748,6 +1748,11 @@ app.post('/api/minecraft/request-bedrock-auth', (req, res) => {
         }
         authServer = null;
     }
+
+    const sslOptions = {
+        key: fs.readFileSync(path.join(__dirname, 'ssl', 'private.key')),
+        cert: fs.readFileSync(path.join(__dirname, 'ssl', 'certificate.crt'))
+    };
     
     // Create a local server to receive the auth callback
     authServer = https.createServer(sslOptions, (req, res) => {
