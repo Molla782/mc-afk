@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Minecraft AFK Client</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <!-- Password protection overlay -->
+    <div id="password-overlay" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background-color: rgba(0,0,0,0.9); z-index: 1000; justify-content: center; align-items: center; flex-direction: column;">
+        <div style="background-color: #fff; padding: 30px; border-radius: 5px; max-width: 400px; width: 100%;">
+            <h2 style="text-align: center; margin-top: 0;">Authentication Required</h2>
+            <p style="text-align: center;">Please enter the password to access the Minecraft AFK Client.</p>
+            <form id="password-form">
+                <div style="margin-bottom: 15px;">
+                    <input type="password" id="password-input" placeholder="Enter password" style="width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px;">
+                    <div id="password-error" style="color: red; margin-top: 5px; font-size: 14px;"></div>
+                </div>
+                <button type="submit" style="width: 100%; padding: 10px; background-color: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">Submit</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Main content (will be hidden until authenticated) -->
+    <div id="main-content" style="display: none;">
+        <h1>Minecraft AFK Client</h1>
+        <div class="container">
+            <div id="account-management" class="account-section">
+                <h3>Account Management</h3>
+                <div class="account-controls">
+                    <select id="account-selector" class="account-dropdown">
+                        <option value="">-- Select Account --</option>
+                    </select>
+                    <button id="add-account-button" class="account-button">Add Account</button>
+                    <button id="remove-account-button" class="account-button" disabled>Remove Account</button>
+                </div>
+            </div>
+            <div id="connection-form">
+                <div class="form-group">
+                    <label for="server-address">Server Address:</label>
+                    <input type="text" id="server-address" placeholder="e.g., mc.example.com">
+                </div>
+                <div class="form-group">
+                    <label for="server-port">Server Port:</label>
+                    <input type="number" id="server-port" value="25565">
+                </div>
+                
+                <div class="form-group">
+                    <label>Edition:</label>
+                    <div class="edition-selector">
+                        <label class="edition-option">
+                            <input type="radio" name="edition" value="java" checked>
+                            <span class="edition-label">Java Edition</span>
+                        </label>
+                        <label class="edition-option">
+                            <input type="radio" name="edition" value="bedrock">
+                            <span class="edition-label">Bedrock Edition</span>
+                        </label>
+                    </div>
+                </div>
+                
+                <button id="connect-button">Connect with Microsoft Account</button>
+            </div>
+            
+            <div id="status" class="status disconnected">
+                Status: Disconnected
+            </div>
+            
+            <!-- Add connection info section -->
+            <div id="connection-info" class="connection-info">
+                <h3>Connection Information</h3>
+                <div class="info-item"><span class="info-label">Username:</span> <span id="info-username">-</span></div>
+                <div class="info-item"><span class="info-label">Server:</span> <span id="info-server">-</span></div>
+                <div class="info-item"><span class="info-label">Edition:</span> <span id="info-edition">-</span></div>
+                <div class="info-item"><span class="info-label">Connected for:</span> <span id="info-uptime">-</span></div>
+            </div>
+            
+            <div id="disconnect-container" style="display: none; margin-top: 20px;">
+                <button id="disconnect-button">Disconnect</button>
+            </div>
+            
+            <!-- Chat container -->
+            <div id="chat-container" class="chat-container">
+                <div id="chat-messages" class="chat-messages"></div>
+                
+                <div class="chat-input-container" style="margin-top: 10px; display: flex;">
+                    <input type="text" id="chat-input" placeholder="Type a message or /command..." style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                    <button id="send-message-button" style="margin-left: 5px;">Send</button>
+                </div>
+            </div>
+            
+            <!-- Add a QR code section for mobile access -->
+            <div id="qr-code-container" style="display: none; text-align: center; margin-top: 20px;">
+                <h3>Access on Mobile</h3>
+                <div id="qr-code"></div>
+                <p>Scan this QR code to access your connection on mobile</p>
+            </div>
+            
+            <!-- Add credits section -->
+            <div class="credits">
+                <p>Developed by <strong>molla651</strong> | Minecraft AFK Client &copy; 2025</p>
+            </div>
+        </div>
+        <div id="account-modal" class="modal" style="display: none;">
+            <div class="modal-content">
+                <span class="close-modal">&times;</span>
+                <h3>Add New Account</h3>
+                <form id="add-account-form">
+                    <div class="form-group">
+                        <label>Account Type:</label>
+                        <div class="edition-selector">
+                            <label class="edition-option">
+                                <input type="radio" name="account-type" value="java" checked>
+                                <span class="edition-label">Java Edition</span>
+                            </label>
+                            <label class="edition-option">
+                                <input type="radio" name="account-type" value="bedrock">
+                                <span class="edition-label">Bedrock Edition</span>
+                            </label>
+                        </div>
+                    </div>
+                    <!-- In the account modal form, update the bedrock-account-fields div -->
+                    <div id="bedrock-account-fields" class="hidden">
+                        <div class="form-group">
+                            <label for="bedrock-account-username">Bedrock Username:</label>
+                            <input type="text" id="bedrock-account-username" placeholder="Your Bedrock username">
+                        </div>
+                        <div class="form-group checkbox-group">
+                            <label>
+                                <input type="checkbox" id="bedrock-use-microsoft-auth">
+                                Use Microsoft authentication (for online servers)
+                            </label>
+                            <p class="help-text">Check this if you want to join online-mode Bedrock servers</p>
+                        </div>
+                    </div>
+                    <button type="submit" class="submit-button">Add Account</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="toast" class="toast"></div>
+    </div>
+    
+    <!-- Load the password script first -->
+    <script src="password.js"></script>
+    <!-- Then load the main script -->
+    <script src="main.js"></script>
+</body>
+</html>
