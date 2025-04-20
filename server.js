@@ -1107,36 +1107,20 @@ async function connectBedrockClient(connectionId) {
                 return false;
             }
             
-            // Set up the authentication flow options
-            clientOptions.offline = false;
-            clientOptions.authTitle = process.env.MS_CLIENT_ID; // Use the client ID from env
-            clientOptions.profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
+            // For Bedrock, we'll use offline mode with the authenticated username
+            // This is a workaround since direct token usage is problematic
+            console.log(`[INFO] Using offline mode with authenticated username: ${connection.username}`);
+            clientOptions.offline = true;
             
-            // Use "live" flow type instead of "msal"
-            clientOptions.flow = "live";
-            
-            // Create the token cache directory if it doesn't exist
-            const profilesDir = clientOptions.profilesFolder;
-            if (!fs.existsSync(profilesDir)) {
-                fs.mkdirSync(profilesDir, { recursive: true });
-            }
-            
-            // Create a token cache file with the proper format for "live" flow
-            const cacheFile = path.join(profilesDir, 'token_cache.json');
-            const cacheData = {
-                "AccessToken": account.accessToken,
-                "RefreshToken": account.refreshToken || "",
-                "Username": account.username,
-                "ExpiresOn": new Date(Date.now() + 86400000).toISOString() // Set expiry to 24h from now
-            };
-            
-            fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2));
-            
-            // Point to the cache file
-            clientOptions.cacheFile = cacheFile;
-            
-            console.log(`[DEBUG] Using profilesFolder: ${clientOptions.profilesFolder}`);
-            console.log(`[DEBUG] Authentication flow set to "live" with token cache`);
+            // Store the connection in activeConnections for later use
+            activeConnections.set(connectionId, {
+                client: null, // Will be set after client creation
+                edition: 'bedrock',
+                username: connection.username,
+                serverAddress: connection.serverAddress,
+                serverPort: connection.serverPort,
+                messages: []
+            });
         } else {
             console.log(`[INFO] Using offline mode for Bedrock connection`);
             clientOptions.offline = true;
@@ -1146,14 +1130,19 @@ async function connectBedrockClient(connectionId) {
         console.log('[DEBUG] Creating Bedrock client with options:', {
             ...clientOptions,
             // Don't log sensitive information
-            authTitle: clientOptions.authTitle ? '[REDACTED]' : undefined,
-            cacheFile: clientOptions.cacheFile ? '[REDACTED PATH]' : undefined
+            username: clientOptions.username
         });
         
         const client = createClient(clientOptions);
         
         // Store client reference
         connection.client = client;
+        
+        // Update the activeConnections entry with the client
+        if (activeConnections.has(connectionId)) {
+            const activeConnection = activeConnections.get(connectionId);
+            activeConnection.client = client;
+        }
         
         // Handle connection events
         client.on('spawn', () => {
