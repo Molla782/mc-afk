@@ -2008,17 +2008,17 @@ async function processBedrockAuthCode(code) {
                 })
             });
             
-            const profileXstsData = await profileXstsResponse.json();
-            
-            if (profileXstsData.error) {
-                console.error('XSTS Profile Error for Bedrock:', profileXstsData.error);
+            const xstsData = await xstsResponse.json();
+    
+            if (xstsData.error) {
+                console.error('XSTS Profile Error for Bedrock:', xstsData.error);
                 // Keep the default username we set earlier
             } else {
                 // Now use the XSTS token to get the profile
                 const profileResponse = await fetch('https://profile.xboxlive.com/users/me/profile/settings?settings=Gamertag', {
                     method: 'GET',
                     headers: {
-                        'Authorization': `XBL3.0 x=${userHash};${profileXstsData.Token}`,
+                        'Authorization': `XBL3.0 x=${userHash};${xstsData.Token}`,
                         'Accept': 'application/json',
                         'x-xbl-contract-version': '2'
                     }
