@@ -1914,6 +1914,7 @@ async function processBedrockAuthCode(code) {
             },
             body: new URLSearchParams({
                 client_id: clientId,
+                client_secret: clientSecret, // Added client_secret parameter
                 code: code,
                 grant_type: 'authorization_code',
                 redirect_uri: redirectUri
