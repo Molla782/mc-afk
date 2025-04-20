@@ -1284,7 +1284,7 @@ app.post('/api/minecraft/request-auth', (req, res) => {
     }
     
     const sslOptions = {
-        key: fs.readFileSync(path.join(__dirname, 'ssl', 'private-unencrypted.key')),
+        key: fs.readFileSync(path.join(__dirname, 'ssl', 'private.key')),
         cert: fs.readFileSync(path.join(__dirname, 'ssl', 'certificate.crt'))
     };
     
