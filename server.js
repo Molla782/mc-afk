@@ -1949,7 +1949,8 @@ async function processBedrockAuthCode(code) {
             console.log('Could not extract email from Bedrock token:', err.message);
         }
         
-        bedrockXboxUsername = xboxUsername;
+        let defaultUsername = userEmail || 'Bedrock Player';
+        bedrockXboxUsername = defaultUsername;
         
         // Step 1: Authenticate with Xbox Live
         console.log('[BEDROCK AUTH] Authenticating with Xbox Live...');
