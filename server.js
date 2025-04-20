@@ -1091,9 +1091,7 @@ async function connectBedrockClient(connectionId) {
         let clientOptions = {
             host: connection.serverAddress,
             port: parseInt(connection.serverPort),
-            // For offline mode, username is directly from connection object
-            // For online mode, bedrock-protocol uses profile info fetched during auth
-            username: connection.username // Keep this for offline fallback/display
+            username: connection.username
         };
         
         if (useAuthentication) {
@@ -1102,36 +1100,41 @@ async function connectBedrockClient(connectionId) {
             // Find the account in the server-side bedrockAccounts array
             const account = bedrockAccounts.find(acc => acc.username === connection.username);
             
-            if (!account || !account.accessToken) { // Check for token existence
+            if (!account || !account.accessToken) {
                 console.error(`[ERROR] Could not find authenticated account data (or token) for ${connection.username} on server.`);
                 connection.status = 'error';
                 connection.error = 'Authentication failed: Server-side account data not found or incomplete. Please re-add the account.';
-                // Optionally trigger frontend error display
-                return false; // Indicate connection failure
+                return false;
             }
             
-            // bedrock-protocol handles the complex auth flow if you provide necessary profile info
-            // It needs more than just the token. It typically uses a cache or requires profile details.
-            // Let's try simplifying by relying on bedrock-protocol's built-in auth flow if possible,
-            // assuming it can use cached credentials or handle the flow given the right options.
+            // Set up the authentication flow options
+            clientOptions.offline = false;
+            clientOptions.authTitle = true;
+            clientOptions.profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
             
-            clientOptions.offline = false; // Explicitly set to online mode
-            clientOptions.authTitle = true; // Indicate Microsoft auth is needed
-            // Specify a folder for bedrock-protocol to cache auth tokens/profiles
-            clientOptions.profilesFolder = path.join(__dirname, '.mc_bedrock_profiles'); 
+            // Add the required 'flow' option
+            clientOptions.flow = {
+                msa: {
+                    // Use the stored access token
+                    access_token: account.accessToken,
+                    refresh_token: account.refreshToken || null,
+                    token_type: "bearer"
+                }
+            };
             
-            // We might not need to pass the token directly if profilesFolder works.
-            // If it doesn't work, bedrock-protocol might need specific profile data.
-            // Passing the raw token might not be sufficient for its internal flow.
             console.log(`[DEBUG] Using profilesFolder: ${clientOptions.profilesFolder}`);
-
+            console.log(`[DEBUG] Authentication flow configured with access token`);
         } else {
             console.log(`[INFO] Using offline mode for Bedrock connection`);
             clientOptions.offline = true;
         }
         
         // Create Bedrock client
-        console.log('[DEBUG] Creating Bedrock client with options:', clientOptions);
+        console.log('[DEBUG] Creating Bedrock client with options:', {
+            ...clientOptions,
+            flow: clientOptions.flow ? 'configured' : undefined // Don't log the actual tokens
+        });
+        
         const client = createClient(clientOptions);
         
         // Store client reference
@@ -1147,7 +1150,7 @@ async function connectBedrockClient(connectionId) {
             addChatMessage(connectionId, 'system', `Connected to ${connection.serverAddress}:${connection.serverPort}`);
         });
         
-        // Handle chat messages
+        // Rest of the event handlers remain the same
         client.on('text', (packet) => {
             if (packet.message) {
                 console.log(`[CHAT] ${packet.message}`);
@@ -1156,19 +1159,13 @@ async function connectBedrockClient(connectionId) {
             }
         });
         
-        // Handle disconnection
         client.on('disconnect', (packet) => {
             console.log(`[INFO] Disconnected from Bedrock server: ${packet?.message || 'Unknown reason'}`);
-            
-            // Add the disconnect message to chat
             addChatMessage(connectionId, 'system', `Disconnected: ${packet?.message || 'Unknown reason'}`);
-            
-            // Update connection status
             connection.status = 'disconnected';
             connection.disconnectReason = packet?.message || 'Unknown reason';
         });
         
-        // Handle errors
         client.on('error', (err) => {
             console.error(`[ERROR] Bedrock client error: ${err.message}`);
             connection.status = 'error';
@@ -1178,10 +1175,10 @@ async function connectBedrockClient(connectionId) {
         
         return true;
     } catch (error) {
-        console.error(`[ERROR] Failed to connect Bedrock client: ${error.message}`, error.stack); // Log stack trace
+        console.error(`[ERROR] Failed to connect Bedrock client: ${error.message}`, error.stack);
         connection.status = 'error';
         connection.error = `Failed to initialize connection: ${error.message}`;
-        return false; // Indicate connection failure
+        return false;
     }
 }
 
