@@ -1111,12 +1111,19 @@ async function connectBedrockClient(connectionId) {
             clientOptions.offline = false;
             clientOptions.authTitle = true;
             
-            // Use the Minecraft access token directly
+            // Use the correct flow type - "live" is the standard Microsoft authentication flow
             clientOptions.auth = 'msa';
             clientOptions.accessToken = account.accessToken;
+            clientOptions.flow = 'live';
             
-            // Add the required flow parameter
-            clientOptions.flow = 'msa';
+            // Create a cache folder for tokens if it doesn't exist
+            const profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
+            if (!fs.existsSync(profilesFolder)) {
+                fs.mkdirSync(profilesFolder, { recursive: true });
+            }
+            
+            // Add profiles folder for token caching
+            clientOptions.profilesFolder = profilesFolder;
             
             console.log(`[INFO] Using authenticated mode with Minecraft access token and flow: ${clientOptions.flow}`);
             
