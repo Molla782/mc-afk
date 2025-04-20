@@ -2256,7 +2256,14 @@ function handleOpenConnectionReply1(connectionId, data, rinfo) {
         
         // Store MTU size and server GUID in connection state
         if (connection.state) {
-            connection.state.mtuSize = mtuSize;
+            // Cap the MTU size to a reasonable value if it's too large
+            // Some servers report incorrect MTU sizes
+            const cappedMtuSize = Math.min(mtuSize, 1400);
+            if (cappedMtuSize !== mtuSize) {
+                console.log(`[INFO] Capping MTU size from ${mtuSize} to ${cappedMtuSize}`);
+            }
+            
+            connection.state.mtuSize = cappedMtuSize;
             connection.state.serverGuid = serverGuid;
             connection.state.security = security === 1;
         }
@@ -2353,13 +2360,27 @@ function handleOpenConnectionReply2(connectionId, data, rinfo) {
         
         // Store MTU size and server GUID in connection state
         if (connection.state) {
-            connection.state.mtuSize = mtuSize;
+            // Use the capped MTU size from reply 1 instead of the one from reply 2
+            // This ensures consistency
+            console.log(`[INFO] Using MTU size: ${connection.state.mtuSize}`);
             connection.state.serverGuid = serverGuid;
             connection.state.encryption = encryption === 1;
         }
         
         // Now send a connection request
         sendConnectionRequest(connectionId);
+        
+        // Set a timeout for the connection request accepted
+        if (connection.state.connectionRequestTimeout) {
+            clearTimeout(connection.state.connectionRequestTimeout);
+        }
+        
+        connection.state.connectionRequestTimeout = setTimeout(() => {
+            if (connection.status !== 'connected') {
+                console.log(`[INFO] Connection request timeout, retrying...`);
+                sendConnectionRequest(connectionId);
+            }
+        }, 5000); // 5 seconds timeout
     } catch (error) {
         console.error(`[ERROR] Error handling open connection reply 2: ${error.message}`);
     }
@@ -2410,6 +2431,12 @@ function handleConnectionRequestAccepted(connectionId, data, rinfo) {
     if (!connection) return;
     
     try {
+        // Clear the timeout
+        if (connection.state && connection.state.connectionRequestTimeout) {
+            clearTimeout(connection.state.connectionRequestTimeout);
+            connection.state.connectionRequestTimeout = null;
+        }
+        
         // Parse the connection request accepted packet
         let offset = 1; // Skip packet ID
         
@@ -2436,6 +2463,15 @@ function handleConnectionRequestAccepted(connectionId, data, rinfo) {
         offset += 8;
         
         console.log(`[INFO] Connection request accepted`);
+        
+        // Store timestamps for later use
+        if (connection.state) {
+            connection.state.serverTimestamp = acceptedTimestamp;
+            connection.state.clientTimestamp = requestTimestamp;
+        }
+        
+        // Send new incoming connection packet
+        sendNewIncomingConnection(connectionId, rinfo);
         
         // Update connection state
         if (connection.state) {
