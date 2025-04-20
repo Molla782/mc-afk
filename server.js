@@ -2195,21 +2195,29 @@ function sendOpenConnectionRequest1(connectionId) {
         magic.copy(buffer, offset);
         offset += 16;
         
-        // Protocol version (11 for Bedrock 1.21.x)
-        buffer.writeUInt8(11, offset++); // Updated from 10 to 11
+        // Protocol version (0x0A for current RakNet)
+        buffer.writeUInt8(0x0A, offset++);
         
-        // MTU size padding (to determine max packet size)
-        // Fill the rest of the packet with padding
-        const paddingSize = 1472 - offset; // Standard MTU size minus current offset
-        buffer.fill(0, offset, offset + paddingSize);
-        offset += paddingSize;
+        // Padding (enough to reach MTU size)
+        const paddingLength = connection.state.mtuSize - offset - 28; // 28 bytes for UDP/IP headers
+        buffer.fill(0, offset, offset + paddingLength);
+        offset += paddingLength;
         
         // Send the packet
         connection.client.send(buffer.slice(0, offset), connection.state.serverPort, connection.state.serverAddress, (err) => {
             if (err) {
                 console.error(`[ERROR] Failed to send open connection request 1: ${err.message}`);
             } else {
-                console.log(`[INFO] Sent open connection request 1 to ${connection.state.serverAddress}:${connection.state.serverPort}`);
+                console.log(`[INFO] Sent open connection request 1 to ${connection.state.serverAddress}:${connection.state.serverPort} with MTU size ${connection.state.mtuSize}`);
+                
+                // Set a timeout for the response
+                if (connection.state.openConnectionRequest1Timeout) {
+                    clearTimeout(connection.state.openConnectionRequest1Timeout);
+                }
+                
+                connection.state.openConnectionRequest1Timeout = setTimeout(() => {
+                    handleOpenConnectionRequest1Timeout(connectionId);
+                }, 3000); // 3 seconds timeout
             }
         });
     } catch (error) {
@@ -2221,6 +2229,12 @@ function handleOpenConnectionReply1(connectionId, data, rinfo) {
     if (!connection) return;
     
     try {
+        // Clear the timeout
+        if (connection.state && connection.state.openConnectionRequest1Timeout) {
+            clearTimeout(connection.state.openConnectionRequest1Timeout);
+            connection.state.openConnectionRequest1Timeout = null;
+        }
+        
         // Parse the open connection reply 1 packet
         let offset = 1; // Skip packet ID
         
@@ -2238,7 +2252,7 @@ function handleOpenConnectionReply1(connectionId, data, rinfo) {
         const mtuSize = data.readUInt16BE(offset);
         offset += 2;
         
-        console.log(`[INFO] Received open connection reply 1: MTU size = ${mtuSize}`);
+        console.log(`[INFO] Received open connection reply 1: MTU size = ${mtuSize}, Server GUID = ${serverGuid}`);
         
         // Store MTU size and server GUID in connection state
         if (connection.state) {
@@ -3638,4 +3652,45 @@ function resolveDomain(domain) {
             resolve(address);
         });
     });
+}
+function handleOpenConnectionRequest1Timeout(connectionId) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    console.log(`[INFO] Open connection request 1 timeout for ${connection.state.serverAddress}:${connection.state.serverPort}`);
+    
+    // Check if we've already tried multiple times
+    connection.state.openConnectionRequest1Attempts = (connection.state.openConnectionRequest1Attempts || 0) + 1;
+    
+    if (connection.state.openConnectionRequest1Attempts < 3) {
+        // Try again with a different MTU size
+        console.log(`[INFO] Retrying open connection request 1 (attempt ${connection.state.openConnectionRequest1Attempts + 1}) with smaller MTU...`);
+        
+        // Reduce MTU size for each retry
+        const mtuSizes = [1400, 1200, 1000, 800];
+        connection.state.mtuSize = mtuSizes[connection.state.openConnectionRequest1Attempts] || 576;
+        
+        // Send the request again
+        sendOpenConnectionRequest1(connectionId);
+    } else {
+        // After multiple attempts, try a different approach
+        console.log(`[INFO] Multiple open connection request 1 attempts failed, trying with minimum MTU...`);
+        
+        // Try with minimum MTU size as last resort
+        connection.state.mtuSize = 576; // Minimum valid MTU size
+        connection.state.openConnectionRequest1Attempts = 0; // Reset counter
+        
+        // Send the request one more time
+        sendOpenConnectionRequest1(connectionId);
+        
+        // Set up a final timeout
+        setTimeout(() => {
+            if (connection.status !== 'connected') {
+                console.log(`[ERROR] Failed to establish connection after multiple attempts`);
+                connection.status = 'error';
+                connection.error = 'Failed to establish connection with the server';
+                addChatMessage(connectionId, 'system', `Error: Failed to establish connection with the server`);
+            }
+        }, 10000);
+    }
 }
