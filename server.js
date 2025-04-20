@@ -1115,7 +1115,10 @@ async function connectBedrockClient(connectionId) {
             clientOptions.auth = 'msa';
             clientOptions.accessToken = account.accessToken;
             
-            console.log(`[INFO] Using authenticated mode with Minecraft access token`);
+            // Add the required flow parameter
+            clientOptions.flow = 'msa';
+            
+            console.log(`[INFO] Using authenticated mode with Minecraft access token and flow: ${clientOptions.flow}`);
             
             // Store the connection in activeConnections for later use
             activeConnections.set(connectionId, {
