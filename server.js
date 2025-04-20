@@ -1109,33 +1109,34 @@ async function connectBedrockClient(connectionId) {
             
             // Set up the authentication flow options
             clientOptions.offline = false;
-            clientOptions.authTitle = true;
+            clientOptions.authTitle = process.env.MS_CLIENT_ID; // Use the client ID from env
             clientOptions.profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
             
-            // Use "msal" as the flow type instead of an object
-            clientOptions.flow = "msal";
+            // Use "live" flow type instead of "msal"
+            clientOptions.flow = "live";
             
-            // Store the token in a file that bedrock-protocol can use
+            // Create the token cache directory if it doesn't exist
             const profilesDir = clientOptions.profilesFolder;
             if (!fs.existsSync(profilesDir)) {
                 fs.mkdirSync(profilesDir, { recursive: true });
             }
             
-            // Create a profile file with the token
-            const profileData = {
-                msa: {
-                    access_token: account.accessToken,
-                    refresh_token: account.refreshToken || null,
-                    token_type: "bearer"
-                },
-                username: account.username
+            // Create a token cache file with the proper format for "live" flow
+            const cacheFile = path.join(profilesDir, 'token_cache.json');
+            const cacheData = {
+                "AccessToken": account.accessToken,
+                "RefreshToken": account.refreshToken || "",
+                "Username": account.username,
+                "ExpiresOn": new Date(Date.now() + 86400000).toISOString() // Set expiry to 24h from now
             };
             
-            const profilePath = path.join(profilesDir, 'default.json');
-            fs.writeFileSync(profilePath, JSON.stringify(profileData, null, 2));
+            fs.writeFileSync(cacheFile, JSON.stringify(cacheData, null, 2));
+            
+            // Point to the cache file
+            clientOptions.cacheFile = cacheFile;
             
             console.log(`[DEBUG] Using profilesFolder: ${clientOptions.profilesFolder}`);
-            console.log(`[DEBUG] Authentication flow set to "msal" and token saved to profile`);
+            console.log(`[DEBUG] Authentication flow set to "live" with token cache`);
         } else {
             console.log(`[INFO] Using offline mode for Bedrock connection`);
             clientOptions.offline = true;
@@ -1145,7 +1146,8 @@ async function connectBedrockClient(connectionId) {
         console.log('[DEBUG] Creating Bedrock client with options:', {
             ...clientOptions,
             // Don't log sensitive information
-            profilesFolder: clientOptions.profilesFolder
+            authTitle: clientOptions.authTitle ? '[REDACTED]' : undefined,
+            cacheFile: clientOptions.cacheFile ? '[REDACTED PATH]' : undefined
         });
         
         const client = createClient(clientOptions);
