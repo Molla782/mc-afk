@@ -1112,18 +1112,30 @@ async function connectBedrockClient(connectionId) {
             clientOptions.authTitle = true;
             clientOptions.profilesFolder = path.join(__dirname, '.mc_bedrock_profiles');
             
-            // Add the required 'flow' option
-            clientOptions.flow = {
+            // Use "msal" as the flow type instead of an object
+            clientOptions.flow = "msal";
+            
+            // Store the token in a file that bedrock-protocol can use
+            const profilesDir = clientOptions.profilesFolder;
+            if (!fs.existsSync(profilesDir)) {
+                fs.mkdirSync(profilesDir, { recursive: true });
+            }
+            
+            // Create a profile file with the token
+            const profileData = {
                 msa: {
-                    // Use the stored access token
                     access_token: account.accessToken,
                     refresh_token: account.refreshToken || null,
                     token_type: "bearer"
-                }
+                },
+                username: account.username
             };
             
+            const profilePath = path.join(profilesDir, 'default.json');
+            fs.writeFileSync(profilePath, JSON.stringify(profileData, null, 2));
+            
             console.log(`[DEBUG] Using profilesFolder: ${clientOptions.profilesFolder}`);
-            console.log(`[DEBUG] Authentication flow configured with access token`);
+            console.log(`[DEBUG] Authentication flow set to "msal" and token saved to profile`);
         } else {
             console.log(`[INFO] Using offline mode for Bedrock connection`);
             clientOptions.offline = true;
@@ -1132,7 +1144,8 @@ async function connectBedrockClient(connectionId) {
         // Create Bedrock client
         console.log('[DEBUG] Creating Bedrock client with options:', {
             ...clientOptions,
-            flow: clientOptions.flow ? 'configured' : undefined // Don't log the actual tokens
+            // Don't log sensitive information
+            profilesFolder: clientOptions.profilesFolder
         });
         
         const client = createClient(clientOptions);
