@@ -1821,14 +1821,12 @@ app.post('/api/minecraft/request-bedrock-auth', (req, res) => {
 });
 // In the check-bedrock-auth endpoint
 app.get('/api/minecraft/check-bedrock-auth', (req, res) => {
-
-
     if (bedrockAuthError) {
         // If there was an error, report it
         res.json({ status: 'error', error: bedrockAuthError });
         // Clear the error after reporting it once
         bedrockAuthError = null; 
-    }else if(bedrockMsaAccessToken && bedrockXboxUsername) {
+    } else if(bedrockMsaAccessToken && bedrockXboxUsername) {
         // Extract email from username if it looks like an email
         let email = null;
         let username = bedrockXboxUsername; // Use the username directly
@@ -1860,22 +1858,26 @@ app.get('/api/minecraft/check-bedrock-auth', (req, res) => {
                     message: 'This Microsoft account has already been added for Bedrock.' 
                 });
             }
-            
-            // Add to accounts if not a duplicate
-            bedrockAccounts.push({
-                email: email,
-                accessToken: bedrockMsaAccessToken,
-                username: username,
-                addedAt: new Date().toISOString()
-            });
         }
+        
+        // Add to accounts if not a duplicate
+        const newAccount = {
+            email: email,
+            accessToken: bedrockMsaAccessToken,
+            username: username,
+            addedAt: new Date().toISOString()
+        };
+        
+        bedrockAccounts.push(newAccount);
+        console.log(`Added new Bedrock account: ${username}`);
+        console.log('Current Bedrock accounts:', bedrockAccounts.map(a => a.username));
         
         // Log the final username being sent
         console.log(`Sending Bedrock username in response: ${username}`);
         
         res.json({
             status: 'authenticated',
-            username: bedrockXboxUsername, // Make sure this is the correct username
+            username: username, // Make sure this is the correct username
             email: email,
             edition: 'Bedrock Edition'
         });
