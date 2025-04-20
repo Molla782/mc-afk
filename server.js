@@ -1395,27 +1395,35 @@ app.get('/api/minecraft/check-auth', (req, res) => {
     }
 });
 
-function addChatMessage(connectionId, sender, message) {
-    // Make sure the connection exists
-    if (!connectionChatMessages.has(connectionId)) {
-        connectionChatMessages.set(connectionId, []);
+function addChatMessage(connectionId, type, message) {
+    const connection = connections[connectionId];
+    if (!connection) return;
+    
+    // Initialize chat history if it doesn't exist
+    if (!connection.chatHistory) {
+        connection.chatHistory = [];
     }
     
-    // Add the message
-    connectionChatMessages.get(connectionId).push({
-        timestamp: Date.now(),
-        sender: sender,
-        message: message
+    // Add message to chat history
+    connection.chatHistory.push({
+        type,
+        message,
+        timestamp: Date.now()
     });
     
-    // Keep only the last 100 messages
-    const messages = connectionChatMessages.get(connectionId);
-    if (messages.length > 100) {
-        connectionChatMessages.set(connectionId, messages.slice(-100));
+    // Limit chat history to 100 messages
+    if (connection.chatHistory.length > 100) {
+        connection.chatHistory.shift();
     }
     
-    // Log the message to console
-    console.log(`[CHAT][${connectionId}] ${sender}: ${message}`);
+    // Emit chat message event for WebSocket clients
+    if (io) {
+        io.to(`connection-${connectionId}`).emit('chat', {
+            type,
+            message,
+            timestamp: Date.now()
+        });
+    }
 }
 
 // Process the auth code to get tokens
@@ -2163,10 +2171,28 @@ function handleBedrockPacket(connectionId, data, rinfo) {
             case 0x1C: // Unconnected Pong
                 handleUnconnectedPong(connectionId, data, rinfo);
                 break;
-            case 0x08: // Connection Request Accepted
+            case 0x06: // Open Connection Reply 1
+                handleOpenConnectionReply1(connectionId, data, rinfo);
+                break;
+            case 0x08: // Open Connection Reply 2
+                handleOpenConnectionReply2(connectionId, data, rinfo);
+                break;
+            case 0x10: // Connection Request Accepted
                 handleConnectionRequestAccepted(connectionId, data, rinfo);
                 break;
-            // Add more packet handlers as needed
+            case 0xA0: // NACK (Negative Acknowledgement)
+                // Handle NACK - resend packets
+                break;
+            case 0xC0: // ACK (Acknowledgement)
+                // Handle ACK - mark packets as received
+                break;
+            case 0x80: // Regular packet
+            case 0x84: // Reliable packet
+            case 0x88: // Ordered packet
+            case 0x8C: // Reliable ordered packet
+                // Handle game packets
+                handleGamePacket(connectionId, data, rinfo);
+                break;
             default:
                 console.log(`[DEBUG] Unhandled packet type: 0x${packetId.toString(16)}`);
         }
@@ -2327,13 +2353,20 @@ function sendOpenConnectionRequest2(connectionId) {
         
         // Server address
         const serverIp = connection.state.serverAddress.split('.');
-        buffer.writeUInt8(4, offset++); // IPv4
-        buffer.writeUInt8(parseInt(serverIp[0]), offset++);
-        buffer.writeUInt8(parseInt(serverIp[1]), offset++);
-        buffer.writeUInt8(parseInt(serverIp[2]), offset++);
-        buffer.writeUInt8(parseInt(serverIp[3]), offset++);
-        buffer.writeUInt16BE(connection.state.serverPort, offset);
-        offset += 2;
+        if (serverIp.length === 4) {
+            // IPv4
+            buffer.writeUInt8(4, offset++); // IPv4
+            buffer.writeUInt8(parseInt(serverIp[0]), offset++);
+            buffer.writeUInt8(parseInt(serverIp[1]), offset++);
+            buffer.writeUInt8(parseInt(serverIp[2]), offset++);
+            buffer.writeUInt8(parseInt(serverIp[3]), offset++);
+            buffer.writeUInt16BE(connection.state.serverPort, offset);
+            offset += 2;
+        } else {
+            // Handle domain name - resolve to IP first
+            console.error(`[ERROR] Domain name not resolved to IP: ${connection.state.serverAddress}`);
+            return;
+        }
         
         // MTU size
         buffer.writeUInt16BE(connection.state.mtuSize, offset);
@@ -2444,52 +2477,41 @@ function handleConnectionRequestAccepted(connectionId, data, rinfo) {
     if (!connection) return;
     
     try {
-        // Parse connection request accepted
+        // Parse the connection request accepted packet
         let offset = 1; // Skip packet ID
         
-        // Read server address
+        // Read client address
         const addressType = data.readUInt8(offset++);
-        let serverAddress;
+        offset += addressType === 4 ? 6 : 18; // Skip client address
         
-        if (addressType === 4) { // IPv4
-            serverAddress = `${data.readUInt8(offset++)}.${data.readUInt8(offset++)}.${data.readUInt8(offset++)}.${data.readUInt8(offset++)}`;
-            const serverPort = data.readUInt16BE(offset);
-            offset += 2;
-            
-            console.log(`[INFO] Server address: ${serverAddress}:${serverPort}`);
-        } else if (addressType === 6) { // IPv6
-            // Skip IPv6 implementation for now
-            offset += 16;
-            const serverPort = data.readUInt16BE(offset);
-            offset += 2;
-        }
-        
-        // Read client address (our address)
-        const clientAddressType = data.readUInt8(offset++);
-        offset += clientAddressType === 4 ? 6 : 18; // Skip client address (4 bytes for IPv4 + 2 for port, or 16 bytes for IPv6 + 2 for port)
-        
-        // Read system addresses (20 of them in the packet)
+        // Read system addresses
         for (let i = 0; i < 20; i++) {
             const systemAddressType = data.readUInt8(offset++);
-            offset += systemAddressType === 4 ? 6 : 18; // Skip system address
+            if (systemAddressType === 4) {
+                offset += 6; // IPv4 + port
+            } else if (systemAddressType === 6) {
+                offset += 18; // IPv6 + port
+            }
         }
         
-        // Read server timestamp
-        const serverTimestamp = data.readBigUInt64BE(offset);
+        // Read request timestamp
+        const requestTimestamp = data.readBigUInt64BE(offset);
         offset += 8;
         
-        // Read client timestamp
-        const clientTimestamp = data.readBigUInt64BE(offset);
+        // Read accepted timestamp
+        const acceptedTimestamp = data.readBigUInt64BE(offset);
         offset += 8;
         
-        // Store timestamps in connection state
-        connection.state.serverTimestamp = serverTimestamp;
-        connection.state.clientTimestamp = clientTimestamp;
+        console.log(`[INFO] Connection request accepted`);
         
-        console.log(`[INFO] Connection request accepted from ${rinfo.address}:${rinfo.port}`);
+        // Update connection state
+        if (connection.state) {
+            connection.state.connected = true;
+            connection.status = 'connected';
+        }
         
-        // Send a new connection request with security
-        sendNewIncomingConnection(connectionId, rinfo);
+        // Now start the login sequence
+        startLoginSequence(connectionId);
     } catch (error) {
         console.error(`[ERROR] Error handling connection request accepted: ${error.message}`);
     }
@@ -2965,36 +2987,32 @@ function handleGamePacket(connectionId, data, rinfo) {
                     console.log(`[INFO] Login successful for ${connection.username}`);
                     connection.status = 'connected';
                     addChatMessage(connectionId, 'system', `Login successful as ${connection.username}`);
-                    
-                    // Send request to spawn
-                    sendRequestChunkRadius(connectionId);
-                } else if (status === 1) { // Login Failed (Server Full)
+                } else if (status === 1) { // Login Failed - Server Full
                     console.log(`[INFO] Login failed: Server full`);
                     connection.status = 'error';
                     connection.error = 'Server full';
-                    addChatMessage(connectionId, 'system', `Login failed: Server full`);
-                } else if (status === 2) { // Login Failed (Invalid Game Version)
-                    console.log(`[INFO] Login failed: Invalid game version`);
+                    addChatMessage(connectionId, 'system', `Error: Server full`);
+                } else if (status === 2) { // Login Failed - Invalid Version
+                    console.log(`[INFO] Login failed: Invalid version`);
                     connection.status = 'error';
-                    connection.error = 'Invalid game version';
-                    addChatMessage(connectionId, 'system', `Login failed: Invalid game version`);
-                } else if (status === 3) { // Login Failed (Invalid Tenant)
-                    console.log(`[INFO] Login failed: Invalid tenant`);
-                    connection.status = 'error';
-                    connection.error = 'Invalid tenant';
-                    addChatMessage(connectionId, 'system', `Login failed: Invalid tenant`);
-                } else if (status === 4) { // Already Logged In
-                    console.log(`[INFO] Already logged in as ${connection.username}`);
-                    // This is not necessarily an error, just a notification
+                    connection.error = 'Invalid version';
+                    addChatMessage(connectionId, 'system', `Error: Invalid version`);
+                } else if (status === 3) { // Already Logged In
+                    console.log(`[INFO] Already logged in`);
+                    connection.status = 'connected';
                     addChatMessage(connectionId, 'system', `Already logged in as ${connection.username}`);
+                } else if (status === 4) { // Login Failed - Server Error
+                    console.log(`[INFO] Login failed: Server error`);
+                    connection.status = 'error';
+                    connection.error = 'Server error';
+                    addChatMessage(connectionId, 'system', `Error: Server error`);
                 }
                 break;
                 
-            case 0x03: // Server To Client Handshake
-                console.log(`[INFO] Received Server To Client Handshake`);
-                // Handle encryption if needed
-                // For now, we'll skip encryption and just acknowledge
-                sendClientToServerHandshake(connectionId);
+            case 0x03: // Start Game
+                console.log(`[INFO] Received Start Game packet`);
+                // Handle start game packet - extract player position, world info, etc.
+                // This is where we would start rendering the world
                 break;
                 
             case 0x05: // Disconnect
@@ -3002,51 +3020,44 @@ function handleGamePacket(connectionId, data, rinfo) {
                 const reasonLength = data.readUInt16BE(offset);
                 offset += 2;
                 const reason = data.toString('utf8', offset, offset + reasonLength);
+                console.log(`[INFO] Disconnected: ${reason}`);
                 
-                console.log(`[INFO] Disconnected from server: ${reason}`);
                 connection.status = 'disconnected';
-                connection.disconnectReason = reason;
+                connection.error = reason;
                 addChatMessage(connectionId, 'system', `Disconnected: ${reason}`);
-                
-                // Clean up resources
-                cleanupConnection(connectionId);
-                break;
-                
-            case 0x07: // Resource Packs Info
-                console.log(`[INFO] Received Resource Packs Info`);
-                // Send resource packs client response (we don't need any resource packs)
-                sendResourcePacksResponse(connectionId);
                 break;
                 
             case 0x0A: // Text (Chat)
                 // Handle chat message
-                handleChatMessage(connectionId, data, offset);
-                break;
+                const type = data.readUInt8(offset++);
                 
-            case 0x0B: // Set Time
-                const time = data.readInt32BE(offset);
-                console.log(`[INFO] Server time set to: ${time}`);
-                break;
+                // Skip sender information
+                if (type === 0) { // Raw
+                    // No sender
+                } else if (type === 1) { // Chat
+                    // Skip sender (variable length string)
+                    const senderLength = data.readUInt16BE(offset);
+                    offset += 2 + senderLength;
+                } else if (type === 2) { // Translation
+                    // Skip parameters
+                    const paramCount = data.readUInt8(offset++);
+                    for (let i = 0; i < paramCount; i++) {
+                        const paramLength = data.readUInt16BE(offset);
+                        offset += 2 + paramLength;
+                    }
+                }
                 
-            case 0x0C: // Start Game
-                console.log(`[INFO] Received Start Game packet`);
-                handleStartGame(connectionId, data, offset);
-                break;
+                // Read message
+                const messageLength = data.readUInt16BE(offset);
+                offset += 2;
+                const message = data.toString('utf8', offset, offset + messageLength);
                 
-            case 0x3A: // Chunk Data
-                // Handle chunk data (for rendering the world)
-                // This is complex and we'll just acknowledge receipt
-                console.log(`[DEBUG] Received chunk data`);
-                break;
-                
-            case 0x8F: // Available Commands
-                console.log(`[INFO] Received available commands`);
-                // Parse available commands if needed
+                console.log(`[CHAT] ${message}`);
+                addChatMessage(connectionId, 'chat', message);
                 break;
                 
             default:
-                // Other game packets - would need to implement as needed
-                console.log(`[DEBUG] Unhandled game packet type: 0x${gamePacketId.toString(16)}`);
+                // Ignore other game packets for now
                 break;
         }
     } catch (error) {
@@ -3330,58 +3341,94 @@ function sendMovementPacket(connectionId) {
     }
 }
 
-// Function to send chat message to the server
 function sendChatMessage(connectionId, message) {
     const connection = connections[connectionId];
-    if (!connection || !connection.client || connection.status !== 'connected') return;
+    if (!connection || !connection.client || !connection.state || !connection.state.connected) return;
     
     try {
-        // Create a Text packet
-        const buffer = Buffer.alloc(512);
+        // Create a text packet
+        const buffer = Buffer.alloc(1024);
         let offset = 0;
         
-        // Game packet ID for Text is 0x0A
+        // Packet ID for text (0x0A)
         buffer.writeUInt8(0x0A, offset++);
         
-        // Type (1 = chat message)
+        // Type (1 for chat)
         buffer.writeUInt8(1, offset++);
         
-        // Needs translation (0 = false)
-        buffer.writeUInt8(0, offset++);
-        
-        // Source name (empty for client messages)
-        buffer.writeUInt16LE(0, offset);
+        // Skip sender (empty string)
+        buffer.writeUInt16BE(0, offset);
         offset += 2;
         
         // Message
-        buffer.writeUInt16LE(message.length, offset);
+        buffer.writeUInt16BE(message.length, offset);
         offset += 2;
         buffer.write(message, offset);
         offset += message.length;
         
-        // Xuid (empty)
-        buffer.writeUInt16LE(0, offset);
-        offset += 2;
-        
-        // Platform chat ID (empty)
-        buffer.writeUInt16LE(0, offset);
-        offset += 2;
-        
         // Wrap in reliable packet
-        const packet = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
+        const reliablePacket = wrapInReliablePacket(buffer.slice(0, offset), connection.state.reliableFrameIndex++);
         
         // Send the packet
-        connection.client.send(packet, connection.state.serverPort, connection.state.serverAddress, (err) => {
+        connection.client.send(reliablePacket, connection.state.serverPort, connection.state.serverAddress, (err) => {
             if (err) {
                 console.error(`[ERROR] Failed to send chat message: ${err.message}`);
             } else {
                 console.log(`[INFO] Sent chat message: ${message}`);
+                
+                // Add to chat history
+                addChatMessage(connectionId, 'self', message);
             }
         });
     } catch (error) {
-        console.error(`[ERROR] Error creating chat message packet: ${error.message}`);
+        console.error(`[ERROR] Error creating chat packet: ${error.message}`);
     }
 }
+
+// Add this endpoint to send chat messages
+app.post('/api/minecraft/chat/:connectionId', (req, res) => {
+    try {
+        const connectionId = req.params.connectionId;
+        const { message } = req.body;
+        
+        if (!message || typeof message !== 'string') {
+            return res.status(400).json({ error: 'Message is required' });
+        }
+        
+        // Check if connection exists
+        if (connections && connections[connectionId]) {
+            // Send chat message
+            sendChatMessage(connectionId, message);
+            
+            return res.json({ success: true });
+        } else {
+            return res.status(404).json({ error: 'Connection not found' });
+        }
+    } catch (error) {
+        console.error('Error sending chat message:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Add this endpoint to get chat history
+app.get('/api/minecraft/chat/:connectionId', (req, res) => {
+    try {
+        const connectionId = req.params.connectionId;
+        
+        // Check if connection exists
+        if (connections && connections[connectionId]) {
+            // Return chat history
+            return res.json({
+                chatHistory: connections[connectionId].chatHistory || []
+            });
+        } else {
+            return res.status(404).json({ error: 'Connection not found' });
+        }
+    } catch (error) {
+        console.error('Error getting chat history:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
 
 // Function to clean up connection resources
 function cleanupConnection(connectionId) {
