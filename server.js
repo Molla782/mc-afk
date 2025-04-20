@@ -1107,10 +1107,15 @@ async function connectBedrockClient(connectionId) {
                 return false;
             }
             
-            // For Bedrock, we'll use offline mode with the authenticated username
-            // This is a workaround since direct token usage is problematic
-            console.log(`[INFO] Using offline mode with authenticated username: ${connection.username}`);
-            clientOptions.offline = true;
+            // Set up the authentication flow options
+            clientOptions.offline = false;
+            clientOptions.authTitle = true;
+            
+            // Use the Minecraft access token directly
+            clientOptions.auth = 'msa';
+            clientOptions.accessToken = account.accessToken;
+            
+            console.log(`[INFO] Using authenticated mode with Minecraft access token`);
             
             // Store the connection in activeConnections for later use
             activeConnections.set(connectionId, {
@@ -1130,7 +1135,7 @@ async function connectBedrockClient(connectionId) {
         console.log('[DEBUG] Creating Bedrock client with options:', {
             ...clientOptions,
             // Don't log sensitive information
-            username: clientOptions.username
+            accessToken: clientOptions.accessToken ? '[REDACTED]' : undefined
         });
         
         const client = createClient(clientOptions);
